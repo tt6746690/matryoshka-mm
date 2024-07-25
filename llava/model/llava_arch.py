@@ -389,7 +389,6 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f'feature_type={feature_type} cannot be retrieved from `encode_images_output`')
             # (B, K) float16 -> bfloat16
-            # router_input = router_input.to(self.get_model().router.get_dtype())
             gating_prob = self.get_model().router(router_input)
         else:
             gating_prob = None
