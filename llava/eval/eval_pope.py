@@ -71,6 +71,10 @@ if __name__ == "__main__":
     questions = [json.loads(line) for line in open(args.question_file)]
     questions = {question['question_id']: question for question in questions}
     answers = [json.loads(q) for q in open(args.result_file)]
+    # wpq: this script assumes `answers` rank by "question_id"
+    # however, chunking introduce random ordering to question.
+    # so sort by question_id before computing metrics.
+    answers = sorted(answers, key=lambda x: x['question_id'])
     for file in os.listdir(args.annotation_dir):
         assert file.startswith('coco_pope_')
         assert file.endswith('.json')

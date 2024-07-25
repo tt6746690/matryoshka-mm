@@ -3,16 +3,36 @@ import json
 import os
 
 import openai
+from openai import OpenAI
 import time
 
 NUM_SECONDS_TO_SLEEP = 0.5
 
 
+
+client = OpenAI(
+    api_key=os.environ['OPENAI_API_KEY'],
+)
+
+
 def get_eval(content: str, max_tokens: int):
     while True:
         try:
-            response = openai.ChatCompletion.create(
-                model='gpt-4-0314',
+            ## wpq: update openai>1.0.0
+            # response = openai.ChatCompletion.create(
+            #     model='gpt-4-0314',
+            #     messages=[{
+            #         'role': 'system',
+            #         'content': 'You are a helpful and precise assistant for checking the quality of the answer.'
+            #     }, {
+            #         'role': 'user',
+            #         'content': content,
+            #     }],
+            #     temperature=0.2,  # TODO: figure out which temperature is best for evaluation
+            #     max_tokens=max_tokens,
+            # )
+            completion = client.chat.completions.create(
+                model="gpt-4-0613",
                 messages=[{
                     'role': 'system',
                     'content': 'You are a helpful and precise assistant for checking the quality of the answer.'
@@ -20,17 +40,19 @@ def get_eval(content: str, max_tokens: int):
                     'role': 'user',
                     'content': content,
                 }],
-                temperature=0.2,  # TODO: figure out which temperature is best for evaluation
+                temperature=0.2, # TODO: figure out which temperature is best for evaluation
                 max_tokens=max_tokens,
             )
             break
-        except openai.error.RateLimitError:
+        except openai.RateLimitError as e:
+            print(f'RateLimitError: {e}')
             pass
         except Exception as e:
             print(e)
         time.sleep(NUM_SECONDS_TO_SLEEP)
 
-    return response['choices'][0]['message']['content']
+    # return response['choices'][0]['message']['content']
+    return completion.choices[0].message.content
 
 
 def parse_score(review):

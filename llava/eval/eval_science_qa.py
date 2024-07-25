@@ -105,6 +105,7 @@ if __name__ == "__main__":
     print(f'Total: {total}, Correct: {correct}, Accuracy: {correct / total * 100:.2f}%, IMG-Accuracy: {multimodal_correct / multimodal_total * 100:.2f}%')
 
     sqa_results['acc'] = correct / total * 100
+    sqa_results['acc_multimodal'] = multimodal_correct / multimodal_total * 100
     sqa_results['correct'] = correct
     sqa_results['count'] = total
 

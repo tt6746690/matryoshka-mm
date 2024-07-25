@@ -34,6 +34,7 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
+from llava.config import ModelConfig
 
 
 from PIL import Image
@@ -74,8 +75,12 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
-    matryoshka_vis_token_scale: Optional[str] = field(default=None)
     unfreeze_mm_vision_tower: bool = field(default=False)
+    # wpq: place-holder to modify `model_config`
+    model_use: Optional[str] = field(default=None)
+    use_alternative: Optional[bool] = field(default=None)
+    matryoshka_vis_token_scale: Optional[str] = field(default=None)
+    moe: Optional[str] = field(default=None)
     
 
 
@@ -87,6 +92,8 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    # wpq
+    train_size: Optional[int] = field(default=None)
 
 
 @dataclass
@@ -679,6 +686,9 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
 
+        if data_args.train_size is not None:
+            list_data_dict = list_data_dict[:data_args.train_size]
+
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
@@ -809,6 +819,30 @@ def train(attn_implementation=None):
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    # wpq: overwrite `model_config` kvs with `model_args`, 
+    # then make sure `model_args` contain default values from `model_config`.
+    model_config = copy.deepcopy(ModelConfig[str(model_args.model_use)])
+    for k in model_config:
+        if getattr(model_args, k, None) is not None:
+            print(f"[overwrite model_config from model_args]: {k} = {model_config[k]} -> {getattr(model_args, k)}")
+            model_config[k] = getattr(model_args, k)
+        setattr(model_args, k, model_config[k])
+    # wpq: save args to a json file 
+    from dataclasses import asdict
+    with training_args.main_process_first(local=False, desc=f"Saving args to `{training_args.output_dir+'.args.json'}`"):
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        args_dict_path = os.path.join(training_args.output_dir, 'args.json')
+        with open(args_dict_path, 'w') as f:
+            model_args_dict = copy.deepcopy(asdict(model_args))
+            model_args_dict['model_use_dict'] = model_config
+            json.dump({
+                'model_args': model_args_dict,
+                'data_args': copy.deepcopy(asdict(data_args)),
+                'training_args': asdict(training_args),
+            }, f, indent=4)
+        print(f'Saving args dict to {args_dict_path}')
+
+
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -858,6 +892,10 @@ def train(attn_implementation=None):
     matryoshka_vis_token_scale = getattr(model_args, 'matryoshka_vis_token_scale', None)
     model.model.config.matryoshka_vis_token_scale = list_of_integers(matryoshka_vis_token_scale)
     model.config.use_cache = False
+
+     # set to default values, otherwise raises `.validate` error on saving.
+    model.generation_config.temperature=1.
+    model.generation_config.top_p=1.
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -965,6 +1003,11 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+        # wpq
+        model.config.config = model_config
+        model.get_model().initialize_additional_modules(model_config)
+
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

@@ -13,18 +13,17 @@ from llava.mm_utils import tokenizer_image_token, process_images, get_model_name
 
 from PIL import Image
 import math
+import random
 
-
-def split_list(lst, n):
-    """Split a list into n (roughly) equal-sized chunks"""
-    chunk_size = math.ceil(len(lst) / n)  # integer division
-    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
-
-
-def get_chunk(lst, n, k):
-    chunks = split_list(lst, n)
-    return chunks[k]
-
+def get_chunk(lst, n, k, seed=0):
+    """randomize the examples ordering. """
+    random.seed(seed)
+    indices = list(range(len(lst)))
+    random.shuffle(indices)  # Shuffle the indices deterministically
+    chunk_size = math.ceil(len(lst) / n) # integer division
+    chunks = [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
+    chunk = [lst[idx] for idx in chunks[k]]
+    return chunk
 
 def eval_model(args):
     # Model
