@@ -213,7 +213,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPastWithGatingProb]:
 
         if self.training and self.get_model().is_m3:
-
+            # "The model is in training mode."
+            
+            # map 'ver=v0_numtoks=[1,9,36,144,576]' to:
+            # ['ver=v0_numtoks=1', 'ver=v0_numtoks=9', 'ver=v0_numtoks=36', 'ver=v0_numtoks=144', 'ver=v0_numtoks=576']
             matryoshka_vis_token_scale = self.get_model().config.config['matryoshka_vis_token_scale']
             kvs = parse_kv_from_string(matryoshka_vis_token_scale)
             if kvs['ver'] == 'v0':
@@ -225,11 +228,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             else:
                 raise ValueError(f"[llava.model.language_model.llava_llama.py] {kvs['ver']} not implemented.")
 
-
-            # print("The model is in training mode.")
             loss = 0
             logits_accumulate = []
-            for matryoshka_vis_token_scale_element in self.config.matryoshka_vis_token_scale:
+            for matryoshka_vis_token_scale_element in matryoshka_vis_token_scale:
                 loss_item, logits, outputs, gating_prob = self.forward_single_matryoshka(
                     input_ids = input_ids,
                     attention_mask = attention_mask,
@@ -246,7 +247,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     matryoshka_vis_token_scale = matryoshka_vis_token_scale_element,
                 )
                 if gating_prob is None:
-                    loss += loss_item/len(self.config.matryoshka_vis_token_scale)
+                    loss += loss_item/len(matryoshka_vis_token_scale)
                 else:
                     loss += loss_item
                 logits_accumulate.append(logits)

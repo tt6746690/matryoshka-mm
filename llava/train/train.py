@@ -131,6 +131,10 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
     mm_vision_tower_lr: Optional[float] = None
+
+    # wpq: added
+    group_by_modality_length_auto: bool = field(default=False)
+    group_by_varlen: bool = field(default=False)
     
 
 
@@ -819,6 +823,9 @@ def train(attn_implementation=None):
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
+    # wpq: https://github.com/microsoft/DeepSpeed/issues/988
+    training_args.gradient_checkpointing_kwargs = {'use_reentrant': False}
+
     # wpq: overwrite `model_config` kvs with `model_args`, 
     # then make sure `model_args` contain default values from `model_config`.
     model_config = copy.deepcopy(ModelConfig[str(model_args.model_use)])
@@ -889,8 +896,9 @@ def train(attn_implementation=None):
             **bnb_model_from_pretrained_args
         )
         
-    matryoshka_vis_token_scale = getattr(model_args, 'matryoshka_vis_token_scale', None)
-    model.model.config.matryoshka_vis_token_scale = list_of_integers(matryoshka_vis_token_scale)
+    # Ues `config.config['matryoshka_vis_token_scale']` instead
+    # matryoshka_vis_token_scale = getattr(model_args, 'matryoshka_vis_token_scale', None)
+    # model.model.config.matryoshka_vis_token_scale = list_of_integers(matryoshka_vis_token_scale)
     model.config.use_cache = False
 
      # set to default values, otherwise raises `.validate` error on saving.

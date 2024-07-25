@@ -139,7 +139,6 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
-
     def initialize_additional_modules(self, model_config):
         """
             call the corresponding init function, 
@@ -148,7 +147,6 @@ class LlavaMetaModel:
 
             assumes `model_config` contains ["use_alternative", "projection_type"]
         """
-
         self.use_alternative = model_config["use_alternative"]
         if not self.use_alternative:
             return
@@ -159,7 +157,6 @@ class LlavaMetaModel:
             print(f"[MetaModel.initialize_additional_modules] {method_name} not implemented.")
         else:
             getattr(self, method_name)(model_config)
-
 
     def initialize_additional_modules_v4(self, model_config):
         """ mixture of experts with matryoshka VLM """
@@ -191,16 +188,15 @@ class LlavaMetaModel:
             if self.is_m3_moe else []
 
     @property
-    def is_m3_moe(self):
-        return self.is_m3 and self.config.config.config.get('moe', None) is not None
-
-    @property
     def is_m3(self):
         return self.use_alternative and \
             self.projection_type == 'v4' and \
             hasattr(self.config, 'config') and \
             self.config.config.get('matryoshka_vis_token_scale', None) is not None
 
+    @property
+    def is_m3_moe(self):
+        return self.is_m3 and self.config.config.get('moe', None) is not None
 
 
 
@@ -318,8 +314,9 @@ class LlavaMetaForCausalLM(ABC):
             call the corresponding `project` function, 
                 e.g., if `self.get_model().projection_type` is "v1", then calls 
                     `self.project_v1()`
-        """
+        """        
         encode_images_output = self.encode_images(images)
+        # (B, L, D)
         image_features = encode_images_output['patch']
         gating_prob = self.router_forward(encode_images_output)
 
@@ -411,6 +408,7 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
 
+        # images: (B, 3, H, W)
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]

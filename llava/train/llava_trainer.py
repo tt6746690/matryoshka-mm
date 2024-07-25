@@ -445,14 +445,14 @@ class LLaVATrainer(Trainer):
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
 
         ### wpq: MoE load balancing loss.
-        if self.model.is_moe:
+        if self.model.get_model().is_m3_moe:
             # use `self.model` to access llama model.
             kvs = parse_kv_from_string(self.model.config.config.get('moe', None))
             ## compute switch transformer load balance loss: https://dl.acm.org/doi/pdf/10.5555/3586589.3586709
-            if kvs['loadb'] == 'switch':
+            if kvs.get('loadb', None) == 'switch':
                 alpha = float(kvs['alpha'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
-                gating_prob_idx = 3
+                gating_prob_idx = len(outputs)-1 # loss, logits, gating_prob
                 assert(outputs[gating_prob_idx].shape[1] == 5)
                 if self.is_world_process_zero():
                     # gather `gating_prob`` (micro-bsz, K) -> (B, K) where K is number of experts.
