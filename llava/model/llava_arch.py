@@ -316,10 +316,13 @@ class LlavaMetaForCausalLM(ABC):
                     `self.project_v1()`
         """        
         encode_images_output = self.encode_images(images)
-        # (B, L, D)
-        image_features = encode_images_output['patch']
-        if self.get_model().config.config.get('projector_loc', 'after_vision_tower') == 'after_vision_tower':
+        image_features = encode_images_output['patch'] # (B, L, D)
+
+        projector_loc = self.get_model().config.config.get('projector_loc', 'after_vision_tower') \
+            if hasattr(self.get_model().config, 'config') else 'after_vision_tower'
+        if projector_loc == 'after_vision_tower':
             image_features = self.get_model().mm_projector(image_features)
+
         gating_prob = self.router_forward(encode_images_output)
 
         if self.get_model().use_alternative:
@@ -334,9 +337,10 @@ class LlavaMetaForCausalLM(ABC):
                 image_features = getattr(self, method_name)(image_features, matryoshka_vis_token_scale=matryoshka_vis_token_scale, gating_prob=gating_prob)
             else:
                 image_features = getattr(self, method_name)(image_features)
-
-        if self.get_model().config.config.get('projector_loc', 'after_vision_tower') == 'after_pooling':
+        
+        if projector_loc == 'after_pooling':
             image_features = self.get_model().mm_projector(image_features)
+
         return {
             'image_features': image_features,
             'gating_prob': gating_prob,

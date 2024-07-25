@@ -292,6 +292,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     images,
                     image_sizes
                 )
+            else:
+                gating_prob = None
 
             outputs = super().forward(
                 input_ids=input_ids,
@@ -341,7 +343,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 _,
                 inputs_embeds,
                 _,
-                gating_prob,
+                _,
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs,
                 position_ids,
@@ -352,7 +354,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 image_sizes=image_sizes,
                 matryoshka_vis_token_scale = matryoshka_vis_token_scale
             )
-        else:
+        else: # text only
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
         return super().generate(
