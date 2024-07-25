@@ -81,6 +81,7 @@ class ModelArguments:
     use_alternative: Optional[bool] = field(default=None)
     matryoshka_vis_token_scale: Optional[str] = field(default=None)
     moe: Optional[str] = field(default=None)
+    projector_loc: Optional[str] = field(default=None)
     
 
 

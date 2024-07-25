@@ -5,4 +5,5 @@ model_config_v4 = {
     "projection_type": "v4",
     "matryoshka_vis_token_scale": None,
     "moe": None,
+    "projector_loc": "after_vision_tower",
 }
