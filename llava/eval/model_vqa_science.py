@@ -106,7 +106,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--answer-prompter", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
-    parser.add_argument("--matryoshka_vis_token_scale", type=int, default=None)
+    parser.add_argument("--matryoshka_vis_token_scale", type=str, default=None)
     args = parser.parse_args()
 
     eval_model(args)

@@ -59,7 +59,7 @@ class DenseGatingNetwork(torch.nn.Module):
             x = self.dropout(x)
         x = self.fc2(x)
         # (B, K) where K is number of experts
-        p = torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32).type_as(x)
+        p = torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32) # bfloat16 -> float32
         return p
 
 
@@ -365,6 +365,7 @@ class LlavaMetaForCausalLM(ABC):
                 numtoks = token_scales[numtoks_idx]
             else:
                 numtoks = int(kvs['numtoks'])
+
             B, H_W, D = image_features.shape
             reshaped_tensor = image_features.view(B, H, W, D)
             # (B, D, H, W)

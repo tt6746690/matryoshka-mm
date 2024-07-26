@@ -76,12 +76,13 @@ class ModelArguments:
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
     unfreeze_mm_vision_tower: bool = field(default=False)
+    
     # wpq: place-holder to modify `model_config`
     model_use: Optional[str] = field(default=None)
+    projector_loc: Optional[str] = field(default=None)
     use_alternative: Optional[bool] = field(default=None)
     matryoshka_vis_token_scale: Optional[str] = field(default=None)
     moe: Optional[str] = field(default=None)
-    projector_loc: Optional[str] = field(default=None)
     
 
 
@@ -501,7 +502,7 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
+            if i != 0 and not getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len -= 1
                 instruction_len -= 1
 
@@ -1033,6 +1034,7 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,

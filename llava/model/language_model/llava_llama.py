@@ -150,6 +150,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             gating_prob_k = None
         ####
 
+
         if gating_prob_k is None:
             # typical LM loss
             loss = None
@@ -173,25 +174,22 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 shift_logits = logits[..., :-1, :].contiguous()
                 # (B, seq_len-1)
                 shift_labels = labels[..., 1:].contiguous()
+                valid_mask = (shift_labels != -100)
                 # Flatten the tokens
                 loss_fct_noreduce = CrossEntropyLoss(reduction='none')
-                L = logits.shape[1]-1
                 # Enable model/pipeline parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
                 gating_prob_k = gating_prob_k.to(shift_logits.device)
                 losses = loss_fct_noreduce(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
                 # (B, seq_len-1)
-                losses = losses.view(-1, L)
-                valid_mask = (shift_labels != -100)
-                if valid_mask.any():
-                    loss = (losses * valid_mask).sum(1) / valid_mask.sum(1)
-                else:
-                    loss = torch.tensor(0.0, dtype=shift_logits.dtype, device=shift_logits.device)
+                losses = losses.view(-1, logits.shape[1]-1)
+                # handle cases where some values in `valid_mask.sum(1)` is 0, causing division by 0
+                loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
                 # (B,)
                 loss = loss * gating_prob_k.reshape_as(loss)
                 # (1,)
                 loss = loss.mean()
-            
+
         return loss, logits, outputs, gating_prob
 
 
@@ -295,6 +293,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             else:
                 gating_prob = None
 
+            # outputs: (loss, logits, past_key_values, hidden_states, attentions)
             outputs = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -309,8 +308,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
             if not return_dict:
-                output = (logits,) + outputs[1:] + (gating_prob,)
-                return (loss,) + output if loss is not None else output
+                if not isinstance(outputs, tuple):
+                    outputs = outputs.to_tuple()
+                return outputs + (gating_prob,)
+
             return CausalLMOutputWithPastWithGatingProb(
                 loss=outputs.loss,
                 logits=outputs.logits,

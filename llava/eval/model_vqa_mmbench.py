@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--all-rounds", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
     parser.add_argument("--lang", type=str, default="en")
-    parser.add_argument("--matryoshka_vis_token_scale", type=int, default=None)
+    parser.add_argument("--matryoshka_vis_token_scale", type=str, default=None)
     args = parser.parse_args()
 
     eval_model(args)
