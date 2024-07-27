@@ -338,6 +338,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
                 losses=None,
+                losses_lm=None,
                 gating_prob=gating_prob,
             )
 
