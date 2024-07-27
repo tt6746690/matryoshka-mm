@@ -15,6 +15,7 @@
 
 from abc import ABC, abstractmethod
 
+import math
 import torch
 import torch.nn as nn
 
@@ -354,25 +355,26 @@ class LlavaMetaForCausalLM(ABC):
         H = W = int(self.get_model().get_vision_tower().config.image_size / self.get_model().get_vision_tower().config.patch_size)
         kvs = parse_kv_from_string(matryoshka_vis_token_scale)
 
-        if kvs['ver'] == 'v0':
+        if kvs['ver'] == 'v0': 
             if kvs['numtoks'] == 'gateprobargmax':
                 if gating_prob is None:
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] requires `gating_prob` to select the right token scale for matryoshka_vis_token_scale={matryoshka_vis_token_scale}')
                 if image_features.shape[0] != 1:
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] only support batch_size=1 for matryoshka_vis_token_scale={matryoshka_vis_token_scale} but got {image_features.shape[0]}. This is ok since only used during inference.')
                 numtoks_idx = torch.argmax(gating_prob.squeeze(0)).item()
-                token_scales = eval(parse_kv_from_string(self.config.config['matryoshka_vis_token_scale'])['numtoks'])
-                numtoks = token_scales[numtoks_idx]
+                numtoks = self.get_model().tokscale_list[numtoks_idx]
             else:
                 numtoks = int(kvs['numtoks'])
 
             B, H_W, D = image_features.shape
             reshaped_tensor = image_features.view(B, H, W, D)
-            # (B, D, H, W)
+            # (B, D, H, W) e.g., (B, 4096, 24, 24)
             reshaped_tensor = reshaped_tensor.permute(0, 3, 1, 2)
-            pool_size = stride = int( np.sqrt(H_W / numtoks) )
-            # (B, D, 3, 3) if numtoks=9
-            pooled_tensor = torch.nn.functional.avg_pool2d(reshaped_tensor, kernel_size=pool_size, stride=stride)
+            h = w = int( math.sqrt(numtoks) )
+            assert(h*w == numtoks)
+            # (B, D, h, w)
+            pooled_tensor = torch.nn.functional.adaptive_avg_pool2d(reshaped_tensor, (h, w))
+            # (B, h, w, D)
             image_features = pooled_tensor.permute(0, 2, 3, 1)
             # (B, numtoks, D)
             image_features = image_features.reshape(B, -1, D)

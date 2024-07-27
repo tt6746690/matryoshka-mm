@@ -34,8 +34,28 @@ except:
     pass
 
 
+
+def lm_loss(logits, labels, vocab_size):
+    # typical LM loss
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss_fct = CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, vocab_size)
+        shift_labels = shift_labels.view(-1)
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+    return loss
+
+
 @dataclass
 class CausalLMOutputWithPastWithGatingProb(CausalLMOutputWithPast):
+    losses: Optional[torch.FloatTensor] = None
+    losses_lm: Optional[torch.FloatTensor] = None
     gating_prob: Optional[torch.FloatTensor] = None
 
 
@@ -151,20 +171,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         ####
 
 
+        loss_lm = lm_loss(logits, labels, self.config.vocab_size)
+
+
         if gating_prob_k is None:
-            # typical LM loss
-            loss = None
-            if labels is not None:
-                # Shift so that tokens < n predict n
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
+            loss = loss_lm
         else:
             # LM loss weighted by gating prob
             loss = None
@@ -174,7 +185,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 shift_logits = logits[..., :-1, :].contiguous()
                 # (B, seq_len-1)
                 shift_labels = labels[..., 1:].contiguous()
-                valid_mask = (shift_labels != -100)
                 # Flatten the tokens
                 loss_fct_noreduce = CrossEntropyLoss(reduction='none')
                 # Enable model/pipeline parallelism
@@ -183,14 +193,16 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 losses = loss_fct_noreduce(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
                 # (B, seq_len-1)
                 losses = losses.view(-1, logits.shape[1]-1)
-                # handle cases where some values in `valid_mask.sum(1)` is 0, causing division by 0
+                # average loss for each example in the batch
+                # while handle cases where some values in `valid_mask.sum(1)` is 0, causing division by 0
+                valid_mask = (shift_labels != -100)
                 loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
                 # (B,)
                 loss = loss * gating_prob_k.reshape_as(loss)
                 # (1,)
                 loss = loss.mean()
 
-        return loss, logits, outputs, gating_prob
+        return loss, logits, outputs, gating_prob, loss_lm
 
 
 
@@ -226,10 +238,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             else:
                 raise ValueError(f"[llava.model.language_model.llava_llama.py] {kvs['ver']} not implemented.")
 
-            loss = 0
+            losses_accumulate = [] # can be weighted or not.
+            losses_lm_accumulate = [] # unweighted lm loss
             logits_accumulate = []
             for matryoshka_vis_token_scale_element in matryoshka_vis_token_scale:
-                loss_item, logits, outputs, gating_prob = self.forward_single_matryoshka(
+                loss_item, logits, outputs, gating_prob, loss_lm_item = self.forward_single_matryoshka(
                     input_ids = input_ids,
                     attention_mask = attention_mask,
                     position_ids = position_ids,
@@ -245,9 +258,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     matryoshka_vis_token_scale = matryoshka_vis_token_scale_element,
                 )
                 if gating_prob is None:
-                    loss += loss_item/len(matryoshka_vis_token_scale)
-                else:
-                    loss += loss_item
+                    loss_item = loss_item/len(matryoshka_vis_token_scale)
+                    loss_lm_item = loss_lm_item/len(matryoshka_vis_token_scale)
+                losses_accumulate.append(loss_item)
+                losses_lm_accumulate.append(loss_lm_item)
                 logits_accumulate.append(logits)
                 # wpq: only logits & loss is the avg of the different scales.
                 #      `past_key_values`, `hidden_states`, `attentions` are from last scale only.
@@ -257,6 +271,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 # logits: (B, seq_len, vocab_size) ->  (B, seq_len_1+...+seq_len_K, vocab_size) where K=#token scales
                 assert len(outputs) == 1, 'len(outputs) == 1 is False'
             logits = torch.cat(logits_accumulate, dim = 1)
+            losses = torch.stack(losses_accumulate)
+            losses_lm = torch.stack(losses_lm_accumulate)
+            loss = losses.sum()
                     
             if not return_dict:
                 output = (logits,) + outputs[1:] + (gating_prob,)
@@ -267,6 +284,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
+                losses=losses,
+                losses_lm=losses_lm,
                 gating_prob=gating_prob,
             )
             
@@ -318,6 +337,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
+                losses=None,
                 gating_prob=gating_prob,
             )
 

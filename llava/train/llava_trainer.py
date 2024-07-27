@@ -441,35 +441,57 @@ class LLaVATrainer(Trainer):
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
+        # wpq: to get `ModelOutputs` instead of tuple.
+        inputs.update({'return_dict': True})
+
         with self.compute_loss_context_manager():
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
+        ## wpq: log per-expert LM loss
+        if outputs.losses is not None: # m3 type training
+            if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                log_dict = {}
+                for k in range(outputs.losses.numel()):
+                    log_dict.update({f'moe/loss_{k}': outputs.losses[k].item()})
+                    log_dict.update({f'moe/loss_lm_{k}': outputs.losses_lm[k].item()})
+
 
         ### wpq: MoE load balancing loss.
         if self.model.get_model().is_m3_moe:
             # use `self.model` to access llama model.
             kvs = parse_kv_from_string(self.model.config.config.get('moe', None))
+            tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
+
+            # (micro-bsz, K)
+            gating_prob = outputs.gating_prob
+            device, dtype = gating_prob.device, gating_prob.dtype
+            assert(gating_prob.shape[1] == len(tokscales))
+
+            with torch.no_grad():
+                # gather `gating_prob`` (micro-bsz, K) -> (B, K) where K is number of experts.
+                gating_prob_list = [torch.zeros_like(outputs.gating_prob) for _ in range(self.args.world_size)]
+                dist.all_gather(gating_prob_list, outputs.gating_prob)
+                batch_gating_prob = torch.cat(gating_prob_list, dim=0)
+                B, K = batch_gating_prob.shape
+                # (K,)
+                batch_per_expert_gating_prob = torch.mean(gating_prob, dim=0)
+                # (K,)
+                batch_per_expert_assignment = torch.nn.functional.one_hot(batch_gating_prob.argmax(dim=1), num_classes=K)
+                batch_per_expert_assignment = batch_per_expert_assignment.sum(dim=0).float() / B
+                batch_per_expert_assignment = batch_per_expert_assignment.to(device).to(dtype)
+
+            if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                for k in range(K):
+                    log_dict.update({f'moe/avg_gating_prob_{k}': batch_per_expert_gating_prob[k].item()})
+                    log_dict.update({f'moe/avg_expert_assignment_{k}': batch_per_expert_assignment[k].item()})
+
             ## compute switch transformer load balance loss: https://dl.acm.org/doi/pdf/10.5555/3586589.3586709
             if kvs.get('loadb', None) == 'switch':
                 alpha = float(kvs['alpha'])
-                tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
-                gating_prob_idx = len(outputs)-1 # loss, logits, gating_prob
-                gating_prob = outputs[gating_prob_idx]
-                device, dtype = gating_prob.device, gating_prob.dtype
-                assert(outputs[gating_prob_idx].shape[1] == len(tokscales))
-
-                # gather `gating_prob`` (micro-bsz, K) -> (B, K) where K is number of experts.
-                gating_prob_list = [torch.zeros_like(outputs[gating_prob_idx]) for _ in range(self.args.world_size)]
-                dist.all_gather(gating_prob_list, outputs[gating_prob_idx])
-                gating_prob = torch.cat(gating_prob_list, dim=0)
-                B, K = gating_prob.shape
-
-                per_expert_assignment = torch.nn.functional.one_hot(gating_prob.argmax(dim=1), num_classes=K)
-                per_expert_assignment = per_expert_assignment.sum(dim=0).float() / B
-                per_expert_assignment = per_expert_assignment.to(device).to(dtype)
                 
                 per_expert_cost_type = kvs.get('costt', 'count')
                 if per_expert_cost_type == 'count': # default used in switch transformers
-                    per_expert_cost = per_expert_assignment
+                    per_expert_cost = batch_per_expert_assignment
                 elif per_expert_cost_type == 'numtoks':
                     per_expert_cost = torch.tensor(tokscales, device=device, dtype=dtype)
                     per_expert_cost = per_expert_cost / per_expert_cost.sum()
@@ -478,35 +500,33 @@ class LLaVATrainer(Trainer):
                     per_expert_cost = torch.log(per_expert_cost+1) # add 1 to prevent cost(tokscale=1)=0
                     per_expert_cost = per_expert_cost / per_expert_cost.sum()
                 elif per_expert_cost_type == 'count*numtoks':
-                    per_expert_cost = torch.nn.functional.one_hot(gating_prob.argmax(dim=1), num_classes=K)
-                    per_expert_cost = per_expert_cost.sum(dim=0).float() / B
+                    per_expert_cost = batch_per_expert_assignment
                     per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
                     per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
                     per_expert_cost *= per_expert_cost_2
+                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
                 elif per_expert_cost_type == 'count*lognumtoks':
-                    per_expert_cost = torch.nn.functional.one_hot(gating_prob.argmax(dim=1), num_classes=K)
-                    per_expert_cost = per_expert_cost.sum(dim=0).float() / B
+                    per_expert_cost = batch_per_expert_assignment
                     per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
                     per_expert_cost_2 = torch.log(per_expert_cost_2+1) # add 1 to prevent cost(tokscale=1)=0
                     per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
                     per_expert_cost *= per_expert_cost_2
+                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
                 else:
                     raise ValueError(f'per_expert_cost_type={per_expert_cost_type} not supported.')
                 
-                per_expert_gating_prob = torch.mean(gating_prob, dim=0)
                 # (K,), (K,) -> (,)
-                loss_switch = alpha * K * (per_expert_cost * per_expert_gating_prob).sum()
+                loss_switch = alpha * K * (per_expert_cost * torch.mean(gating_prob, dim=0)).sum()
                 loss += loss_switch
+                
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({'moe_load/loss_switch': loss_switch.item(),})
+                    for k in range(K):
+                        log_dict.update({f'moe_load/cost_{k}': per_expert_cost[k].item()})
 
-                if self.is_world_process_zero():
-                    if 'wandb' in self.args.report_to: # log once/batch if assume no gradient accumulation.
-                        log_dict = {}
-                        log_dict.update({'moe_load/loss_switch': loss_switch.item(),})
-                        for k in range(K):
-                            log_dict.update({f'moe_load/avg_gating_prob_{k}': per_expert_gating_prob[k].item()})
-                            log_dict.update({f'moe_load/avg_expert_assignment_{k}': per_expert_assignment[k].item()})
-                            log_dict.update({f'moe_load/cost_{k}': per_expert_cost[k].item()})
-                        wandb.log(log_dict)
+         # log once/batch if assume no gradient accumulation.
+        if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+            wandb.log(log_dict)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training

@@ -15,6 +15,9 @@ gpu_list="${CUDA_VISIBLE_DEVICES:-0}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
+
+output_file=$SAVE_DIR/$SPLIT/answers/merge.jsonl
+
 if [[ ! -f "$SAVE_DIR/$SPLIT/answers/merge.jsonl" ]]; then
 
     for IDX in $(seq 0 $((CHUNKS-1))); do
@@ -31,8 +34,6 @@ if [[ ! -f "$SAVE_DIR/$SPLIT/answers/merge.jsonl" ]]; then
     done
 
     wait
-
-    output_file=$SAVE_DIR/$SPLIT/answers/merge.jsonl
 
     echo $output_file
 
