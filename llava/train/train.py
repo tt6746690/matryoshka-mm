@@ -77,12 +77,15 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     unfreeze_mm_vision_tower: bool = field(default=False)
     
-    # wpq: place-holder to modify `model_config`
+    # wpq: added
+    tune_router: bool = field(default=False)
     model_use: Optional[str] = field(default=None)
+    # wpq: place-holder to modify `model_config`
     projector_loc: Optional[str] = field(default=None)
     use_alternative: Optional[bool] = field(default=None)
     matryoshka_vis_token_scale: Optional[str] = field(default=None)
     moe: Optional[str] = field(default=None)
+    lm_loss_type: Optional[str] = field(default=None)
     
 
 
@@ -137,6 +140,7 @@ class TrainingArguments(transformers.TrainingArguments):
     # wpq: added
     group_by_modality_length_auto: bool = field(default=False)
     group_by_varlen: bool = field(default=False)
+    router_lr: Optional[float] = None
     
 
 
@@ -1003,7 +1007,7 @@ def train(attn_implementation=None):
         model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower or getattr(model.config, 'unfreeze_mm_vision_tower', False)
         if model_args.unfreeze_mm_vision_tower:
             vision_tower.requires_grad_(True)
-            
+
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -1017,6 +1021,12 @@ def train(attn_implementation=None):
         # wpq
         model.config.config = model_config
         model.get_model().initialize_additional_modules(model_config)
+
+        router = model.get_router() # by default has grad
+        if router is not None and model_args.tune_router:
+            model.config.tune_router = model_args.tune_router
+            model.requires_grad_(False)
+            router.requires_grad_(True)
 
 
     if training_args.bits in [4, 8]:

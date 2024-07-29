@@ -199,6 +199,12 @@ class LlavaMetaModel:
     def is_m3_moe(self):
         return self.is_m3 and self.config.config.get('moe', None) is not None
 
+    def get_router(self):
+        router = getattr(self, 'router', None)
+        if type(router) is list:
+            router = router[0]
+        return router
+
 
 
 def unpad_image(tensor, original_size):
@@ -241,6 +247,9 @@ class LlavaMetaForCausalLM(ABC):
 
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
+
+    def get_router(self):
+        return self.get_model().get_router()
 
     def encode_images_with_attn(self, images):
         # images: (B, 3, H, W)

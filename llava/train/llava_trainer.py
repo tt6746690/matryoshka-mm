@@ -319,6 +319,8 @@ class LLaVATrainer(Trainer):
                 lr_mapper['mm_projector'] = self.args.mm_projector_lr
             if self.args.mm_vision_tower_lr is not None:
                 lr_mapper['vision_tower'] = self.args.mm_vision_tower_lr
+            if self.args.router_lr is not None:
+                lr_mapper['router'] = self.args.router_lr
             if len(lr_mapper) > 0:
                 special_lr_parameters = [name for name, _ in opt_model.named_parameters() if any(module_keyword in name for module_keyword in lr_mapper)]
                 optimizer_grouped_parameters = [
@@ -488,39 +490,37 @@ class LLaVATrainer(Trainer):
             ## compute switch transformer load balance loss: https://dl.acm.org/doi/pdf/10.5555/3586589.3586709
             if kvs.get('loadb', None) == 'switch':
                 alpha = float(kvs['alpha'])
-                
                 per_expert_cost_type = kvs.get('costt', 'count')
-                if per_expert_cost_type == 'count': # default used in switch transformers
-                    per_expert_cost = batch_per_expert_assignment
-                elif per_expert_cost_type == 'numtoks':
-                    per_expert_cost = torch.tensor(tokscales, device=device, dtype=dtype)
-                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
-                elif per_expert_cost_type == 'lognumtoks':
-                    per_expert_cost = torch.tensor(tokscales, device=device, dtype=dtype)
-                    per_expert_cost = torch.log(per_expert_cost+1) # add 1 to prevent cost(tokscale=1)=0
-                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
-                elif per_expert_cost_type == 'count*numtoks':
-                    per_expert_cost = batch_per_expert_assignment
-                    per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
-                    per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
-                    per_expert_cost *= per_expert_cost_2
-                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
-                elif per_expert_cost_type == 'count*lognumtoks':
-                    per_expert_cost = batch_per_expert_assignment
-                    per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
-                    per_expert_cost_2 = torch.log(per_expert_cost_2+1) # add 1 to prevent cost(tokscale=1)=0
-                    per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
-                    per_expert_cost *= per_expert_cost_2
-                    per_expert_cost = per_expert_cost / per_expert_cost.sum()
-                else:
-                    raise ValueError(f'per_expert_cost_type={per_expert_cost_type} not supported.')
-                
+                per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
                 # (K,), (K,) -> (,)
                 loss_switch = alpha * K * (per_expert_cost * torch.mean(gating_prob, dim=0)).sum()
                 loss += loss_switch
                 
                 if self.is_world_process_zero() and 'wandb' in self.args.report_to:
                     log_dict.update({'moe_load/loss_switch': loss_switch.item(),})
+                    for k in range(K):
+                        log_dict.update({f'moe_load/cost_{k}': per_expert_cost[k].item()})
+            elif kvs.get('loadb', None) == 'argmaxcost':
+                # apply expert specific cost to argmax of `gating_prob`
+                alpha = float(kvs['alpha'])
+                per_expert_cost_type = kvs.get('costt')
+                # if hard=True, taking argmax and therefore `tau` does not really matter.
+                tau = kvs.get('tau')
+                hard = False if int(kvs.get('hard')) == 0 else True
+                target_value = float(kvs.get('tval', None))
+                # (K,)
+                per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
+                # (micro-bsz, K)
+                gating_prob_argmax = torch.nn.functional.gumbel_softmax(gating_prob, tau=tau, hard=hard, dim=1)
+                argmaxcost = (gating_prob_argmax * per_expert_cost.reshape(-1, K)).sum(1).mean() # since cost sums to 1, therefore sum wrt expert dimension
+                if target_value is not None:
+                    loss_argmaxcost = alpha * torch.square(argmaxcost - target_value)
+                else:
+                    loss_argmaxcost = alpha * argmaxcost
+                loss += loss_argmaxcost
+
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({'moe_load/loss_argmaxcost': loss_argmaxcost.item(),})
                     for k in range(K):
                         log_dict.update({f'moe_load/cost_{k}': per_expert_cost[k].item()})
 
@@ -538,3 +538,33 @@ class LLaVATrainer(Trainer):
             self.accelerator.backward(loss)
 
         return loss.detach() / self.args.gradient_accumulation_steps
+    
+
+
+
+def get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype):
+    if per_expert_cost_type == 'count': # default used in switch transformers
+        per_expert_cost = batch_per_expert_assignment
+    elif per_expert_cost_type == 'numtoks':
+        per_expert_cost = torch.tensor(tokscales, device=device, dtype=dtype)
+        per_expert_cost = per_expert_cost / per_expert_cost.sum()
+    elif per_expert_cost_type == 'lognumtoks':
+        per_expert_cost = torch.tensor(tokscales, device=device, dtype=dtype)
+        per_expert_cost = torch.log(per_expert_cost+1) # add 1 to prevent cost(tokscale=1)=0
+        per_expert_cost = per_expert_cost / per_expert_cost.sum()
+    elif per_expert_cost_type == 'count*numtoks':
+        per_expert_cost = batch_per_expert_assignment
+        per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
+        per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
+        per_expert_cost *= per_expert_cost_2
+        per_expert_cost = per_expert_cost / per_expert_cost.sum()
+    elif per_expert_cost_type == 'count*lognumtoks':
+        per_expert_cost = batch_per_expert_assignment
+        per_expert_cost_2 = torch.tensor(tokscales, device=device, dtype=dtype)
+        per_expert_cost_2 = torch.log(per_expert_cost_2+1) # add 1 to prevent cost(tokscale=1)=0
+        per_expert_cost_2 = per_expert_cost_2 / per_expert_cost_2.sum()
+        per_expert_cost *= per_expert_cost_2
+        per_expert_cost = per_expert_cost / per_expert_cost.sum()
+    else:
+        raise ValueError(f'per_expert_cost_type={per_expert_cost_type} not supported.')
+    return per_expert_cost

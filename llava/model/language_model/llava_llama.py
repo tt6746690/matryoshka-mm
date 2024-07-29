@@ -35,20 +35,77 @@ except:
 
 
 
-def lm_loss(logits, labels, vocab_size):
+def lm_loss(logits, labels, lm_loss_type='micro'):
+    """Compute LM loss.
+        default huggingface's implementation uses `micro` average.
+    """
+    vocab_size = logits.shape[-1]
     # typical LM loss
     loss = None
     if labels is not None:
         # Shift so that tokens < n predict n
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
+        if lm_loss_type == 'micro':
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+        elif lm_loss_type == 'macro':
+            loss_fct_noreduce = CrossEntropyLoss(reduction='none')
+            shift_labels = shift_labels.to(shift_logits.device)
+            losses = loss_fct_noreduce(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+            losses = losses.view(-1, shift_labels.shape[-1])
+            valid_mask = (shift_labels != -100)
+            # (B,)
+            loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
+            # (1,)
+            loss = loss.mean()
+        else:
+            raise ValueError(f'invalid lm_loss_type = {lm_loss_type}')
+        
+    return loss
+
+
+def lm_loss_weighted(logits, labels, sample_weights, lm_loss_type='micro'):
+    """Compute LM loss weighted by `sample_weights`.
+        `sample_weights`    (B,)
+    """
+    vocab_size = logits.shape[-1]
+    # LM loss weighted by gating prob
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        # (B, seq_len-1, vocab_size)
+        shift_logits = logits[..., :-1, :].contiguous()
+        # (B, seq_len-1)
+        shift_labels = labels[..., 1:].contiguous()
         # Flatten the tokens
-        loss_fct = CrossEntropyLoss()
-        shift_logits = shift_logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-        # Enable model parallelism
+        loss_fct_noreduce = CrossEntropyLoss(reduction='none')
+        # Enable model/pipeline parallelism
         shift_labels = shift_labels.to(shift_logits.device)
-        loss = loss_fct(shift_logits, shift_labels)
+        sample_weights = sample_weights.to(shift_logits.device)
+        losses = loss_fct_noreduce(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+        # (B, seq_len-1)
+        losses = losses.view(-1, logits.shape[1]-1)
+        valid_mask = (shift_labels != -100)
+        if lm_loss_type == 'micro':
+            loss = (losses * valid_mask).sum(1)
+            # (B,)
+            loss = loss * sample_weights.reshape_as(loss)
+            # (1,)
+            loss = loss.sum() / (valid_mask.sum() + 1e-8)
+        elif lm_loss_type == 'macro':
+            loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
+            # (B,)
+            loss = loss * sample_weights.reshape_as(loss)
+            # (1,)
+            loss = loss.mean()
+        else:
+            raise ValueError(f'invalid lm_loss_type = {lm_loss_type}')
     return loss
 
 
@@ -170,37 +227,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             gating_prob_k = None
         ####
 
+        lm_loss_type = self.get_model().config.config.get('lm_loss_type', 'micro')
+        # for logging purposes
+        with torch.no_grad():
+            loss_lm = lm_loss(logits, labels, lm_loss_type)
 
-        loss_lm = lm_loss(logits, labels, self.config.vocab_size)
-
-
-        if gating_prob_k is None:
-            loss = loss_lm
+        if gating_prob_k is not None:
+            loss = lm_loss_weighted(logits, labels, gating_prob_k, lm_loss_type)
         else:
-            # LM loss weighted by gating prob
-            loss = None
-            if labels is not None:
-                # Shift so that tokens < n predict n
-                # (B, seq_len-1, vocab_size)
-                shift_logits = logits[..., :-1, :].contiguous()
-                # (B, seq_len-1)
-                shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                loss_fct_noreduce = CrossEntropyLoss(reduction='none')
-                # Enable model/pipeline parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                gating_prob_k = gating_prob_k.to(shift_logits.device)
-                losses = loss_fct_noreduce(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-                # (B, seq_len-1)
-                losses = losses.view(-1, logits.shape[1]-1)
-                # average loss for each example in the batch
-                # while handle cases where some values in `valid_mask.sum(1)` is 0, causing division by 0
-                valid_mask = (shift_labels != -100)
-                loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
-                # (B,)
-                loss = loss * gating_prob_k.reshape_as(loss)
-                # (1,)
-                loss = loss.mean()
+            loss = lm_loss(logits, labels, lm_loss_type)
 
         return loss, logits, outputs, gating_prob, loss_lm
 
