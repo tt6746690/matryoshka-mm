@@ -109,6 +109,33 @@ def lm_loss_weighted(logits, labels, sample_weights, lm_loss_type='micro'):
     return loss
 
 
+def lm_loss_unreduced(logits, labels, lm_loss_type='micro'):
+    """Compute LM loss in unreduced form such that 
+        when taking mean, equal in value to reduced loss.
+    """
+    vocab_size = logits.shape[-1]
+    # typical LM loss
+    loss = None
+    if labels is not None:
+        # Shift so that tokens < n predict n
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct_noreduce = CrossEntropyLoss(reduction='none')
+        shift_labels = shift_labels.to(shift_logits.device)
+        losses = loss_fct_noreduce(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+        losses = losses.view(-1, shift_labels.shape[-1])
+        valid_mask = (shift_labels != -100)
+        if lm_loss_type == 'micro':
+            loss = (losses * valid_mask).sum(1)
+            loss = loss * loss.shape[0] / (valid_mask.sum() + 1e-8)
+        elif lm_loss_type == 'macro':
+            loss = (losses * valid_mask).sum(1) / (valid_mask.sum(1) + 1e-8)
+        else:
+            raise ValueError(f'invalid lm_loss_type = {lm_loss_type}')
+        
+    return loss
+
+
 @dataclass
 class CausalLMOutputWithPastWithGatingProb(CausalLMOutputWithPast):
     losses: Optional[torch.FloatTensor] = None
@@ -228,10 +255,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         ####
 
         lm_loss_type = self.get_model().config.config.get('lm_loss_type', 'micro')
-        # for logging purposes
-        with torch.no_grad():
-            loss_lm = lm_loss(logits, labels, lm_loss_type)
-
+        
+        loss_lm = lm_loss_unreduced(logits, labels, lm_loss_type)
         if gating_prob_k is not None:
             loss = lm_loss_weighted(logits, labels, gating_prob_k, lm_loss_type)
         else:
@@ -307,7 +332,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 assert len(outputs) == 1, 'len(outputs) == 1 is False'
             logits = torch.cat(logits_accumulate, dim = 1)
             losses = torch.stack(losses_accumulate)
-            losses_lm = torch.stack(losses_lm_accumulate)
+            losses_lm = torch.stack(losses_lm_accumulate).T # (B, K)
             loss = losses.sum()
                     
             if not return_dict:

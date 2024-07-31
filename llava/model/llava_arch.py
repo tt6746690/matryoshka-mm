@@ -14,8 +14,7 @@
 
 
 from abc import ABC, abstractmethod
-
-import math
+import math, re
 import torch
 import torch.nn as nn
 
@@ -27,6 +26,7 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 import torch.nn.functional as F
 import numpy as np
+from transformers import AutoTokenizer, AutoModel
 
 
 try:
@@ -35,6 +35,62 @@ except:
     pass
 
 
+text_embedders = {'bge15small': '/fsx/wpq/.results/baselines/BAAI/bge-small-en-v1.5',}
+
+
+class TextEmbedder(torch.nn.Module):
+
+    def __init__(self, vlm_name_or_path, embedder_name_or_path):
+        super().__init__()
+        self.vlm_name_or_path = vlm_name_or_path
+        self.embedder_name_or_path = embedder_name_or_path
+        self.is_loaded = False
+
+    def load_model(self, device_map=None):
+        if self.is_loaded:
+            return
+        self.tokenizer_vlm = AutoTokenizer.from_pretrained(self.vlm_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.embedder_name_or_path)
+        if device_map is not None:
+            self.model = AutoModel.from_pretrained(self.embedder_name_or_path, device_map=device_map)
+        else:
+            self.model = AutoModel.from_pretrained(self.embedder_name_or_path)
+        # model loading during inference BERT model cannot be init with `device_map='auto'`
+        # do a monkey patch by adding `_no_split_modules`
+        # https://github.com/huggingface/transformers/issues/25296
+        # https://github.com/huggingface/transformers/issues/29786
+        if 'bge-small' in self.embedder_name_or_path:
+            self.model._no_split_modules = ["BertLayer"]
+        self.is_loaded = True
+
+    @torch.no_grad()
+    def forward(self, input_ids):
+        self.model.eval()
+        input_ids = input_ids.clone()
+        input_ids[input_ids==-200] = 0 # remove image token_id
+        texts = self.tokenizer_vlm.batch_decode(input_ids, skip_special_tokens=True)
+        # extract prompt from text 
+        pattern = r"USER:\s*(.*?)\s*ASSISTANT:"
+        prompts = []
+        for s in texts:
+            match = re.search(pattern, s, re.DOTALL)  # re.DOTALL allows '.' to match newlines as well
+            if match:
+                prompts.append(match.group(1).strip())
+            else:
+                print(f'Could not extract prompt for example:\n {s}')
+                prompts.append('')
+        inputs = self.tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
+        inputs = {k: v.to(self.model.device) for k,v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            embed = outputs[0][:, 0] # cls token
+        embed = torch.nn.functional.normalize(embed, p=2, dim=1)
+        return embed
+    
+    @property
+    def hidden_size(self):
+        return self.model.config.hidden_size
+    
 
 class DenseGatingNetwork(torch.nn.Module):
     """A simple mean-pooling gating network for selecting experts.
@@ -166,15 +222,22 @@ class LlavaMetaModel:
 
             model_type = kvs['t']
             if model_type == 'dense':
-                feature_type = kvs['ft']
-                if feature_type in ('cls', 'clslast', 'patchavgpool', 'poolout'):
-                    # embed_dim = self.get_vision_tower().config.hidden_size # not yet loaded
-                    embed_dim = self.config.mm_hidden_size
-                elif feature_type in ('attnqk', 'attnkk'):
-                    # embed_dim = self.get_vision_tower().num_patches
-                    embed_dim = 576 # hard code for now.
+                feature_types = str(kvs['ft']).split(',')
+                embed_dim = 0
+                if 'textcls' in feature_types:
+                    embedder_name = kvs.get('embedm', 'bge15small')
+                    self.prompt_embed_model = TextEmbedder(
+                        vlm_name_or_path=self.config._name_or_path,
+                        embedder_name_or_path=text_embedders[embedder_name],
+                    )
+                    self.prompt_embed_model.load_model()
+                    embed_dim += self.prompt_embed_model.hidden_size
+                if any(x in feature_types for x in ('cls', 'clslast', 'patchavgpool', 'poolout')):
+                    embed_dim += self.config.mm_hidden_size
+                elif any(x in feature_types for x in ('attnqk', 'attnkk')):
+                    embed_dim += 576 # hard code for now.
                 else:
-                    raise ValueError(f"[initialize_additional_modules_v4] feature_type={feature_type} cannot determine `embed_dim`.")
+                    raise ValueError(f"[initialize_additional_modules_v4] feature_types={feature_types} cannot determine `embed_dim`.")
                 self.router = DenseGatingNetwork(
                     embed_dim=embed_dim,
                     num_experts=len(self.tokscale_list),
@@ -319,7 +382,7 @@ class LlavaMetaForCausalLM(ABC):
         else:
             return self.encode_images_original(images)
 
-    def project(self, images, matryoshka_vis_token_scale=None):
+    def project(self, images, matryoshka_vis_token_scale=None, input_ids=None):
         """
             call the corresponding `project` function, 
                 e.g., if `self.get_model().projection_type` is "v1", then calls 
@@ -333,7 +396,7 @@ class LlavaMetaForCausalLM(ABC):
         if projector_loc == 'after_vision_tower':
             image_features = self.get_model().mm_projector(image_features)
 
-        gating_prob = self.router_forward(encode_images_output)
+        gating_prob = self.router_forward(encode_images_output, input_ids)
 
         if self.get_model().use_alternative:
             projection_type = self.get_model().projection_type
@@ -392,14 +455,21 @@ class LlavaMetaForCausalLM(ABC):
 
         return image_features
 
-    def router_forward(self, encode_images_output):
+    def router_forward(self, encode_images_output, input_ids):
         if self.get_model().is_m3_moe:
             kvs = parse_kv_from_string(self.get_model().config.config['moe'])
-            feature_type = kvs['ft']
-            if feature_type in encode_images_output:
-                router_input = encode_images_output[feature_type]
-            else:
-                raise ValueError(f'feature_type={feature_type} cannot be retrieved from `encode_images_output`')
+            # feature_type = kvs['ft']
+            feature_types = str(kvs['ft']).split(',')
+            router_input = []
+            for feature_type in feature_types:
+                if feature_type in encode_images_output:
+                    router_input.append(encode_images_output[feature_type])
+                elif feature_type == 'textcls':
+                    text_embed = self.get_model().prompt_embed_model(input_ids)
+                    router_input.append(text_embed)
+                else:
+                    raise ValueError(f'feature_type={feature_type} no available.')
+            router_input = torch.cat(router_input, dim=1)
             # (B, K) float16 -> bfloat16
             gating_prob = self.get_model().router(router_input)
         else:
@@ -431,7 +501,7 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            project_outputs = self.project(concat_images, matryoshka_vis_token_scale=matryoshka_vis_token_scale)
+            project_outputs = self.project(concat_images, matryoshka_vis_token_scale=matryoshka_vis_token_scale, input_ids=input_ids)
             image_features = project_outputs['image_features']
             gating_prob = project_outputs['gating_prob'] # wpq: most likely wrong .. verify this is as intended.
             split_sizes = [image.shape[0] for image in images]
@@ -479,7 +549,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            project_outputs = self.project(images, matryoshka_vis_token_scale=matryoshka_vis_token_scale)
+            project_outputs = self.project(images, matryoshka_vis_token_scale=matryoshka_vis_token_scale, input_ids=input_ids)
             image_features = project_outputs['image_features']
             gating_prob = project_outputs['gating_prob']
                 

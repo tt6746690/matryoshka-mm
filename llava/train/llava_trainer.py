@@ -437,7 +437,12 @@ class LLaVATrainer(Trainer):
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
-        inputs = self._prepare_inputs(inputs)
+        # inputs = self._prepare_inputs(inputs)
+
+        # print({
+        #     'rank': self.args.process_index,
+        #     'seq_len': (inputs['labels'] != -100).sum(1),
+        # })
 
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -453,9 +458,9 @@ class LLaVATrainer(Trainer):
         if outputs.losses is not None: # m3 type training
             if self.is_world_process_zero() and 'wandb' in self.args.report_to:
                 log_dict = {}
+                losses_lm_reduced = torch.mean(outputs.losses_lm, 0) # (1,) unweighted lm loss
                 for k in range(outputs.losses.numel()):
-                    log_dict.update({f'moe/loss_{k}': outputs.losses[k].item()})
-                    log_dict.update({f'moe/loss_lm_{k}': outputs.losses_lm[k].item()})
+                    log_dict.update({f'moe/loss_lm_{k}': losses_lm_reduced[k].item()})
 
 
         ### wpq: MoE load balancing loss.
@@ -485,7 +490,35 @@ class LLaVATrainer(Trainer):
             if self.is_world_process_zero() and 'wandb' in self.args.report_to:
                 for k in range(K):
                     log_dict.update({f'moe/avg_gating_prob_{k}': batch_per_expert_gating_prob[k].item()})
+                for k in range(K):
                     log_dict.update({f'moe/avg_expert_assignment_{k}': batch_per_expert_assignment[k].item()})
+
+
+            moe_objective_type = kvs.get('obj', 'weightedlm')
+            if moe_objective_type.startswith('bounderr'):
+                margin = float(kvs.get('margin', 0))
+                # (micro-bsz, K)
+                gating_prob_argmax = compute_gating_prob_argmax(gating_prob, kvs)
+                # assume token scale sorted, largeest token scale at the end.
+                # (micro-bsz, K)
+                losses_lm = outputs.losses_lm
+                # (micro-bsz)
+                losses_argmaxscale = (losses_lm * gating_prob_argmax).sum(1)
+                losses_maxtokscale = losses_lm[:, -1]
+                losses_diff = losses_argmaxscale - losses_maxtokscale
+                if moe_objective_type == 'bounderr':
+                    loss = torch.clamp(losses_diff - margin, min=0).mean()
+                elif moe_objective_type == 'bounderrsq':
+                    loss = torch.square(torch.clamp(losses_diff - margin, min=0)).mean()
+
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({
+                        'moe_bounderr/loss_argmaxscale_avg': losses_argmaxscale.mean().item(),
+                        'moe_bounderr/loss_maxscale_avg': losses_maxtokscale.mean().item(),
+                        'moe_bounderr/loss_diff_avg': losses_diff.mean().item(),
+                    })
+            elif moe_objective_type == 'weightedlm':
+                pass
 
             ## compute switch transformer load balance loss: https://dl.acm.org/doi/pdf/10.5555/3586589.3586709
             if kvs.get('loadb', None) == 'switch':
@@ -504,14 +537,13 @@ class LLaVATrainer(Trainer):
                 # apply expert specific cost to argmax of `gating_prob`
                 alpha = float(kvs['alpha'])
                 per_expert_cost_type = kvs.get('costt')
-                # if hard=True, taking argmax and therefore `tau` does not really matter.
-                tau = kvs.get('tau')
-                hard = False if int(kvs.get('hard')) == 0 else True
+                # since `argmaxcost` normalized to [0,1], therefore, select target value within [0,1] suffices.
                 target_value = float(kvs.get('tval', None))
                 # (K,)
                 per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
-                # (micro-bsz, K)
-                gating_prob_argmax = torch.nn.functional.gumbel_softmax(gating_prob, tau=tau, hard=hard, dim=1)
+                if not moe_objective_type.startswith('bounderr'): # already initialized `gating_prob_argmax`
+                    # (micro-bsz, K)
+                    gating_prob_argmax =compute_gating_prob_argmax(gating_prob, kvs)
                 argmaxcost = (gating_prob_argmax * per_expert_cost.reshape(-1, K)).sum(1).mean() # since cost sums to 1, therefore sum wrt expert dimension
                 if target_value is not None:
                     loss_argmaxcost = alpha * torch.square(argmaxcost - target_value)
@@ -523,6 +555,19 @@ class LLaVATrainer(Trainer):
                     log_dict.update({'moe_load/loss_argmaxcost': loss_argmaxcost.item(),})
                     for k in range(K):
                         log_dict.update({f'moe_load/cost_{k}': per_expert_cost[k].item()})
+            elif kvs.get('loadb', None) == 'betalogprob':
+                if K != 2:
+                    raise ValueError(f'#tokscale = {K} not supported.')
+                alpha = float(kvs['alpha'])
+                beta_alpha = float(kvs['ba'])
+                beta_beta = float(kvs['bb'])
+                beta_dist = torch.distributions.Beta(beta_alpha, beta_beta)
+                log_prob = beta_dist.log_prob(gating_prob[:,1])
+                loss_beta_logprob = alpha * log_prob.sum()
+                loss += loss_beta_logprob
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({'moe_load/loss_beta_logprob': loss_beta_logprob.item(),})
+
 
          # log once/batch if assume no gradient accumulation.
         if self.is_world_process_zero() and 'wandb' in self.args.report_to:
@@ -540,6 +585,14 @@ class LLaVATrainer(Trainer):
         return loss.detach() / self.args.gradient_accumulation_steps
     
 
+
+def compute_gating_prob_argmax(gating_prob, kvs):
+    # if hard=True, taking argmax and therefore `tau` does not really matter.
+    tau = float(kvs.get('tau', 1))
+    hard = bool(kvs.get('hard', True))
+    # (micro-bsz, K)
+    gating_prob_argmax = torch.nn.functional.gumbel_softmax(gating_prob, tau=tau, hard=hard, dim=1)
+    return gating_prob_argmax
 
 
 def get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype):
