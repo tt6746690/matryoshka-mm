@@ -334,9 +334,26 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             losses = torch.stack(losses_accumulate)
             losses_lm = torch.stack(losses_lm_accumulate).T # (B, K)
             loss = losses.sum()
-                    
+
+            # import pdb; pdb.set_trace()
+            # print('|y|:', (labels==-100).sum(-1).detach().cpu().numpy())
+            # print('L(x_144,y): ', losses_lm_accumulate[0].detach().cpu().numpy())
+            # print('L(x_576,y): ', losses_lm_accumulate[1].detach().cpu().numpy())
+            # print('L144-L576: ', (losses_lm_accumulate[0] - losses_lm_accumulate[1]).detach().cpu().numpy())
+            # print('(L144-L576)/L576: ', ((losses_lm_accumulate[0] - losses_lm_accumulate[1])/losses_lm_accumulate[1]).detach().cpu().numpy())
+            # print('(L144-L576)/L576/|y|: ', ((losses_lm_accumulate[0] - losses_lm_accumulate[1])/losses_lm_accumulate[1]/(labels==-100).sum(-1)).detach().cpu().numpy())
+            # print('(L144-L576)/|y|: ', ((losses_lm_accumulate[0] - losses_lm_accumulate[1])/(labels==-100).sum(-1)).detach().cpu().numpy())
+
+            # # |y|: [131, 728, 749, 729]
+            # # L(x_144,y):  [2.9188077  0.05875813 0.01026795 0.08600413]
+            # # L(x_576,y):  [2.9119728  0.05523928 0.0090314  0.07313347]
+            # # L144-L576:   [0.00683498 0.00351885 0.00123655 0.01287066]
+            # # (L144-L576)/L576:  [0.0023472  0.06370195 0.13691707 0.17598867]
+            # # (L144-L576)/L576/|y|:  [1.7917560e-05 8.7502682e-05 1.8279982e-04 2.4141108e-04]
+            # # (L144-L576)/|y|:  [5.2175448e-05 4.8335846e-06 1.6509377e-06 1.7655229e-05]
+
             if not return_dict:
-                output = (logits,) + outputs[1:] + (gating_prob,)
+                output = (logits,) + outputs[1:] + (losses, losses_lm, gating_prob,)
                 return (loss,) + output if loss is not None else output
             return CausalLMOutputWithPastWithGatingProb(
                 loss=loss,
@@ -389,7 +406,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if not return_dict:
                 if not isinstance(outputs, tuple):
                     outputs = outputs.to_tuple()
-                return outputs + (gating_prob,)
+                return outputs + (None, None, gating_prob,)
 
             return CausalLMOutputWithPastWithGatingProb(
                 loss=outputs.loss,
