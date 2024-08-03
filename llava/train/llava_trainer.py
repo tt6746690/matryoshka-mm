@@ -556,7 +556,7 @@ class LLaVATrainer(Trainer):
                     argmaxcost_list = torch.cat(argmaxcost_list, dim=0)
                     batch_argmaxcost = argmaxcost_list.mean()
                 if target_value is not None:
-                    loss_argmaxcost = alpha * torch.square(argmaxcost - target_value)
+                    loss_argmaxcost = alpha * torch.square(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin - target_value)
                 else:
                     loss_argmaxcost = alpha * torch.clamp(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin, min=0)
                 loss += loss_argmaxcost
