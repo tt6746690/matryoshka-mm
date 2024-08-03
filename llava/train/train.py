@@ -1003,10 +1003,6 @@ def train(attn_implementation=None):
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
-                
-        model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower or getattr(model.config, 'unfreeze_mm_vision_tower', False)
-        if model_args.unfreeze_mm_vision_tower:
-            vision_tower.requires_grad_(True)
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
@@ -1027,6 +1023,12 @@ def train(attn_implementation=None):
             model.config.tune_router = model_args.tune_router
             model.requires_grad_(False)
             router.requires_grad_(True)
+
+
+        ## put unfreeze after all potenntial tweaks to requires_grad
+        model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower or getattr(model.config, 'unfreeze_mm_vision_tower', False)
+        if model_args.unfreeze_mm_vision_tower:
+            vision_tower.requires_grad_(True)
 
 
     if training_args.bits in [4, 8]:

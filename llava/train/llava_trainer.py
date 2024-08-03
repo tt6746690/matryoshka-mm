@@ -538,19 +538,28 @@ class LLaVATrainer(Trainer):
                 alpha = float(kvs['alpha'])
                 per_expert_cost_type = kvs.get('costt')
                 # since `argmaxcost` normalized to [0,1], therefore, select target value within [0,1] suffices.
-                target_value = float(kvs.get('tval', None))
+                target_value = kvs.get('tval', None)
+                numtoks_margin = kvs.get('tmargin', None)
                 # (K,)
                 per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
                 if not moe_objective_type.startswith('bounderr'): # already initialized `gating_prob_argmax`
                     # (micro-bsz, K)
-                    gating_prob_argmax =compute_gating_prob_argmax(gating_prob, kvs)
-                argmaxcost = (gating_prob_argmax * per_expert_cost.reshape(-1, K)).sum(1).mean() # since cost sums to 1, therefore sum wrt expert dimension
+                    gating_prob_argmax = compute_gating_prob_argmax(gating_prob, kvs)
+                # (1,) micro-batch cost
+                # since cost sums to 1, therefore sum wrt expert dimension
+                argmaxcost = (gating_prob_argmax * per_expert_cost.reshape(-1, K)).sum(1).mean()
+                # (1,) batch average cost
+                # if just use micro-batch cost in loss, too noisy since micro-bsz is quite small (e.g., 4)
+                with torch.no_grad():
+                    argmaxcost_list = [torch.zeros_like(argmaxcost.unsqueeze(0)) for _ in range(self.args.world_size)]
+                    dist.all_gather(argmaxcost_list, argmaxcost.unsqueeze(0))
+                    argmaxcost_list = torch.cat(argmaxcost_list, dim=0)
+                    batch_argmaxcost = argmaxcost_list.mean()
                 if target_value is not None:
                     loss_argmaxcost = alpha * torch.square(argmaxcost - target_value)
                 else:
-                    loss_argmaxcost = alpha * argmaxcost
+                    loss_argmaxcost = alpha * torch.clamp(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin, min=0)
                 loss += loss_argmaxcost
-
                 if self.is_world_process_zero() and 'wandb' in self.args.report_to:
                     log_dict.update({'moe_load/loss_argmaxcost': loss_argmaxcost.item(),})
                     for k in range(K):
