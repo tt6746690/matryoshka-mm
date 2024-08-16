@@ -141,6 +141,8 @@ class CausalLMOutputWithPastWithGatingProb(CausalLMOutputWithPast):
     losses: Optional[torch.FloatTensor] = None
     losses_lm: Optional[torch.FloatTensor] = None
     gating_prob: Optional[torch.FloatTensor] = None
+    sequence_lengths: Optional[List[int]] = None
+    labels: Optional[torch.FloatTensor] = None
 
 
 class LlavaConfig(LlamaConfig):
@@ -262,7 +264,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             loss = lm_loss(logits, labels, lm_loss_type)
 
-        return loss, logits, outputs, gating_prob, loss_lm
+        return loss, logits, outputs, gating_prob, loss_lm, labels
 
 
 
@@ -301,8 +303,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             losses_accumulate = [] # can be weighted or not.
             losses_lm_accumulate = [] # unweighted lm loss
             logits_accumulate = []
+            labels_accumulate = []
             for matryoshka_vis_token_scale_element in matryoshka_vis_token_scale:
-                loss_item, logits, outputs, gating_prob, loss_lm_item = self.forward_single_matryoshka(
+                loss_item, logits, outputs, gating_prob, loss_lm_item, new_labels = self.forward_single_matryoshka(
                     input_ids = input_ids,
                     attention_mask = attention_mask,
                     position_ids = position_ids,
@@ -323,6 +326,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 losses_accumulate.append(loss_item)
                 losses_lm_accumulate.append(loss_lm_item)
                 logits_accumulate.append(logits)
+                labels_accumulate.append(new_labels)
                 # wpq: only logits & loss is the avg of the different scales.
                 #      `past_key_values`, `hidden_states`, `attentions` are from last scale only.
                 #      this is ok since this conditional block is used in training only that just needs `loss`.
@@ -330,7 +334,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 # loss:   (1,)                     ->  (1,)             
                 # logits: (B, seq_len, vocab_size) ->  (B, seq_len_1+...+seq_len_K, vocab_size) where K=#token scales
                 assert len(outputs) == 1, 'len(outputs) == 1 is False'
+            sequence_lengths = [x.shape[1] for x in logits_accumulate]
             logits = torch.cat(logits_accumulate, dim = 1)
+            labels_new = torch.cat(labels_accumulate, dim = 1)
             losses = torch.stack(losses_accumulate)
             losses_lm = torch.stack(losses_lm_accumulate).T # (B, K)
             loss = losses.sum()
@@ -364,6 +370,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 losses=losses,
                 losses_lm=losses_lm,
                 gating_prob=gating_prob,
+                sequence_lengths=sequence_lengths,
+                labels=labels_new,
             )
             
         else:
@@ -417,6 +425,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 losses=None,
                 losses_lm=None,
                 gating_prob=gating_prob,
+                sequence_lengths=None,
+                labels=None,
             )
 
 

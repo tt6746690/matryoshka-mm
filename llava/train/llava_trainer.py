@@ -517,8 +517,99 @@ class LLaVATrainer(Trainer):
                         'moe_bounderr/loss_maxscale_avg': losses_maxtokscale.mean().item(),
                         'moe_bounderr/loss_diff_avg': losses_diff.mean().item(),
                     })
+            elif moe_objective_type.startswith('lmlossaddcost'):
+                lamb = kvs.get('lambda', 0.)
+                per_expert_cost_type = kvs.get('costt', 'count')
+                per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
+
+                losses_lm = outputs.losses_lm
+                # (micro-bsz, K) lm loss plus the numtoks cost, i.e., (-log p(y|x_q,x_k) + lamb*c_k)
+                losses = losses_lm + lamb * per_expert_cost.reshape(1, K)
+                # (micro-bsz,) lm loss + cost weight by gating_prob: L = Σ_k p_k(x) * (-log p(y|x_q,x_k) + c_k)
+                losses_weight_by_gating_prob = (losses * gating_prob.reshape_as(losses)).sum(1)
+                # (1,)
+                loss = losses_weight_by_gating_prob.mean()
+
+                # print({
+                #     'rank': self.args.process_index,
+                #     'losses': losses,
+                #     'losses_weight_by_gating_prob': losses_weight_by_gating_prob,
+                #     'fraction_logits_increase': (((losses - losses_weight_by_gating_prob.reshape(-1, 1)) < 0).sum(0) / losses.shape[0]).tolist(),
+                # })
+                ## for logging purposes only.
+                with torch.no_grad():
+                    # gather `losses`` (micro-bsz, K) -> (B, K) where K is number of experts.
+                    losses_list = [torch.zeros_like(losses.contiguous()) for _ in range(self.args.world_size)] if self.is_world_process_zero() else None
+                    dist.gather(losses.contiguous(), losses_list, dst=0)
+                    losses_weight_by_gating_prob_list = [torch.zeros_like(losses_weight_by_gating_prob.contiguous()) for _ in range(self.args.world_size)] if self.is_world_process_zero() else None
+                    dist.gather(losses_weight_by_gating_prob.contiguous(), losses_weight_by_gating_prob_list, dst=0)
+                    dist.barrier() # in case if dist.gather is an async operation
+
+                    if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                        batch_losses = torch.cat(losses_list, dim=0)
+                        # (B, K)
+                        batch_losses_weight_by_gating_prob = torch.cat(losses_weight_by_gating_prob_list, dim=0)
+                        # (K,) counts experts whose logits would increase during gradient update.
+                        batch_fraction_logits_increase = ((batch_losses - batch_losses_weight_by_gating_prob.reshape(-1, 1)) < 0).sum(0) / batch_losses.shape[0]
+                        for k, count in enumerate(batch_fraction_logits_increase.tolist()):
+                            log_dict.update({
+                                f'moe_lmlossaddcost/frac_incr_logits_{k}': count,
+                            })
+
+                        # print({
+                        #     'batch_losses': batch_losses,
+                        #     'batch_losses_weight_by_gating_prob': batch_losses_weight_by_gating_prob,
+                        #     'batch_fraction_logits_increase': batch_fraction_logits_increase.tolist(),
+                        # })
+            elif moe_objective_type == 'distil':
+                temperature = float(kvs['temp'])
+                alpha = float(kvs['alpha'])
+                detach_teacher_grad = bool(kvs.get('detacht', 0) != 0)
+
+                labels = outputs.labels
+                logits = outputs.logits
+                sequence_lengths = outputs.sequence_lengths
+                
+                labels_list = labels.split(sequence_lengths, 1)
+                logits_list = logits.split(sequence_lengths, 1)
+                if not (len(labels_list) == len(logits_list) == 2):
+                    raise ValueError('Assume two token scales.')
+
+                logits_s, logits_t = logits_list[0], logits_list[-1]
+                labels_s, labels_t = labels_list[0], labels_list[-1]
+
+                if detach_teacher_grad:
+                    logits_t = logits_t.detach()
+
+                # pad student logits/labels to same sequence length as teacher logits/labels
+                seq_diff = sequence_lengths[-1] - sequence_lengths[0]
+                logits_s = torch.cat((torch.zeros((logits_s.shape[0], seq_diff, logits_s.shape[-1]), device=logits_s.device, dtype=logits_s.dtype), logits_s), 1)
+
+                shift_logits_s = logits_s[..., :-1, :].contiguous()
+                shift_logits_t = logits_t[..., :-1, :].contiguous()
+                shift_labels = labels_t[..., 1:].contiguous()
+                # Compute distillation loss, i.e., cross entropy with teach prob as soft target: E_{p_t(y|x)} [ -log p_s(y|x) ]
+                # reference: https://github.com/GeondoPark/CKD/blob/main/loss.py#L41
+                # reference: https://github.com/haitongli/knowledge-distillation-pytorch/blob/master/model/net.py#L100
+                # (B, seq_len-1, vocab_size)
+                logprob_s = torch.nn.functional.log_softmax( shift_logits_s / temperature, dim=-1 )
+                # (B, seq_len-1, vocab_size)
+                prob_t = torch.softmax( shift_logits_t / temperature, dim=-1 )
+                # (B, seq_len-1)
+                cross_entropy_losses = torch.sum( - prob_t * logprob_s, dim=-1)
+                # (B, seq_len-1)
+                valid_mask = (shift_labels != -100)
+                # (1,)
+                loss_distil = (cross_entropy_losses * valid_mask).sum() / (valid_mask.sum() + 1e-8) * (temperature**2)
+                loss_distil = alpha * loss_distil
+
+                loss += loss_distil
+
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({'moe_distill/loss_distil': loss_distil.item(),})
             elif moe_objective_type == 'weightedlm':
                 pass
+
 
             ## compute switch transformer load balance loss: https://dl.acm.org/doi/pdf/10.5555/3586589.3586709
             if kvs.get('loadb', None) == 'switch':
@@ -542,6 +633,7 @@ class LLaVATrainer(Trainer):
                 numtoks_margin = kvs.get('tmargin', None)
                 # (K,)
                 per_expert_cost = get_per_expert_cost(per_expert_cost_type, batch_per_expert_assignment, tokscales, device, dtype)
+
                 if not moe_objective_type.startswith('bounderr'): # already initialized `gating_prob_argmax`
                     # (micro-bsz, K)
                     gating_prob_argmax = compute_gating_prob_argmax(gating_prob, kvs)
@@ -555,10 +647,18 @@ class LLaVATrainer(Trainer):
                     dist.all_gather(argmaxcost_list, argmaxcost.unsqueeze(0))
                     argmaxcost_list = torch.cat(argmaxcost_list, dim=0)
                     batch_argmaxcost = argmaxcost_list.mean()
+                if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                    log_dict.update({'moe_load/argmaxcost': batch_argmaxcost.item(),})
+                if kvs.get('emaa', None):
+                    # use exponential moving average on `batch_argmaxcost`, same update on each process.
+                    batch_argmaxcost = self.model.get_model()   .argmaxcost_ema(batch_argmaxcost)
+                    if self.is_world_process_zero() and 'wandb' in self.args.report_to:
+                        log_dict.update({'moe_load/argmaxcost_ema': batch_argmaxcost.item(),})
                 if target_value is not None:
-                    loss_argmaxcost = alpha * torch.square(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin - target_value)
+                    loss_argmaxcost = alpha * torch.square(batch_argmaxcost - argmaxcost.detach() + argmaxcost - target_value)
                 else:
-                    loss_argmaxcost = alpha * torch.clamp(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin, min=0)
+                    loss_argmaxcost = alpha * torch.square(torch.clamp(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin, min=0))
+                    # loss_argmaxcost = alpha * torch.clamp(batch_argmaxcost - argmaxcost.detach() + argmaxcost - numtoks_margin, min=0)
                 loss += loss_argmaxcost
                 if self.is_world_process_zero() and 'wandb' in self.args.report_to:
                     log_dict.update({'moe_load/loss_argmaxcost': loss_argmaxcost.item(),})
@@ -600,7 +700,8 @@ def compute_gating_prob_argmax(gating_prob, kvs):
     tau = float(kvs.get('tau', 1))
     hard = bool(kvs.get('hard', True))
     # (micro-bsz, K)
-    gating_prob_argmax = torch.nn.functional.gumbel_softmax(gating_prob, tau=tau, hard=hard, dim=1)
+    # gating_prob_argmax = torch.nn.functional.gumbel_softmax(gating_prob, tau=tau, hard=hard, dim=1)
+    gating_prob_argmax = torch.nn.functional.softmax(gating_prob / tau, dim=-1)
     return gating_prob_argmax
 
 

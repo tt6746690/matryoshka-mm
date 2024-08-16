@@ -38,6 +38,21 @@ except:
 text_embedders = {'bge15small': '/fsx/wpq/.results/baselines/BAAI/bge-small-en-v1.5',}
 
 
+
+class ExponentialMovingAverage(nn.Module):
+    def __init__(self, alpha: float):
+        super(ExponentialMovingAverage, self).__init__()
+        self.alpha = alpha
+        self.register_buffer('ema', None)  # Register ema as a buffer to properly handle the state
+
+    def forward(self, value: torch.Tensor):
+        if self.ema is None:
+            self.ema = value.detach()  # Detach to ensure it has no grad
+        else:
+            self.ema = self.alpha * value.detach() + (1 - self.alpha) * self.ema
+        return self.ema
+
+
 class TextEmbedder(torch.nn.Module):
 
     def __init__(self, vlm_name_or_path, embedder_name_or_path):
@@ -118,6 +133,16 @@ class DenseGatingNetwork(torch.nn.Module):
         # (B, K) where K is number of experts
         p = torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32) # bfloat16 -> float32
         return p
+
+
+class UniformGatingNetwork(torch.nn.Module):
+
+    def __init__(self, num_experts):
+        super().__init__()
+        self.num_experts = num_experts
+
+    def forward(self, x):
+        return torch.ones((x.shape[0], self.num_experts), dtype=torch.float32, device=x.device) / self.num_experts
 
 
 class LlavaMetaModel:
@@ -243,8 +268,17 @@ class LlavaMetaModel:
                     num_experts=len(self.tokscale_list),
                     dropout=kvs.get('dropout', None),
                 )
+            elif model_type == 'id':
+                self.router = UniformGatingNetwork(
+                    num_experts=len(self.tokscale_list),
+                )
             else:
                 raise ValueError(f'[initialize_additional_modules_v4] model_type={model_type} not impl.')
+
+            if kvs.get('loadb', '') == 'argmaxcost':
+                ema_alpha = kvs.get('emaa', None)
+                if ema_alpha:
+                    self.argmaxcost_ema = ExponentialMovingAverage(ema_alpha)
 
     @property
     def tokscale_list(self):
@@ -566,6 +600,7 @@ class LlavaMetaForCausalLM(ABC):
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
 
+
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,
@@ -602,15 +637,15 @@ class LlavaMetaForCausalLM(ABC):
                 continue
 
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
-            cur_labels_noim = []
+            cur_input_ids_noim = [] # [torch.Size([35]), torch.Size([49])] basically before&after <image>.
+            cur_labels = labels[batch_idx] # (85,)
+            cur_labels_noim = [] # [torch.Size([35]), torch.Size([49])]
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
+            split_sizes = [x.shape[0] for x in cur_labels_noim] # [35, 49]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0) # [torch.Size([35, 4096]), torch.Size([49, 4096])]
             cur_new_input_embeds = []
             cur_new_labels = []
 
@@ -618,18 +653,18 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
                 if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
+                    cur_image_features = image_features[cur_image_idx] # torch.Size([36, 4096])
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
-            cur_new_input_embeds = torch.cat(cur_new_input_embeds)
+            cur_new_input_embeds = torch.cat(cur_new_input_embeds) # [35+36+49, 4096]
             cur_new_labels = torch.cat(cur_new_labels)
 
             new_input_embeds.append(cur_new_input_embeds)
-            new_labels.append(cur_new_labels)
+            new_labels.append(cur_new_labels) # [35+36+49,]
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
