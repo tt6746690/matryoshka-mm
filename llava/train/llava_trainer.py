@@ -594,11 +594,12 @@ class LLaVATrainer(Trainer):
             elif moe_objective_type == 'distilpickteacher':
                 temperature = float(kvs['temp'])
                 alpha = float(kvs['alpha'])
-                detach_teacher_grad = bool(kvs.get('detacht', 0) != 0)
+                detach_teacher_grad = bool(kvs.get('detacht', 0))
                 tokscales_s = eval(kvs['tss'])
                 tokscales_t = eval(kvs['tst'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
                 pick_teacher_by = kvs['pickby']
+                distil_from_same_tokscale = bool(kvs.get('sametokscaledistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
 
                 if pick_teacher_by == 'logprob': # higher the better
                     score_fn = compute_seq_logprob
@@ -619,32 +620,32 @@ class LLaVATrainer(Trainer):
                 # pad to same length as largest 
                 logits_list = pad_logits_to_longest(logits_list, max([x.shape[1] for x in logits_list]))
 
-                assert(len(tokscales_s) == 1)
-                tokscale_s_id = tokscales.index(tokscales_s[0])
-                logits_s = logits_list[tokscale_s_id]
-                labels = labels_list[-1] # last tokcale is biggest token scale.
+                # logits corresponding to teachers [(B, longest seq_len, vocab_size), ...]
+                logits_t_list = [ logits_list[tokscales.index(tokscale_t)] for tokscale_t in tokscales_t ]
+                # compute score to select the teacher
+                scores = [ score_fn(logits_t, labels) for logits_t in logits_t_list ]
 
-                losses = []
-                scores = []
-                for tokscale_t in tokscales_t:
-                    tokscale_t_id = tokscales.index(tokscale_t)
-                    logits_t = logits_list[tokscale_t_id]
-                    # (B,)
-                    loss_distil_seq = tokenwise_kd_loss(logits_t, logits_s, labels, temperature, detach_teacher_grad, reduction='seqlevel_mean')
-                    losses.append(loss_distil_seq)
-                    score = score_fn(logits_t, labels)
-                    scores.append(score)
-
-                # (B, num_teachers)
-                losses = torch.stack(losses).T
+                # (B, K)
                 scores = torch.stack(scores).T
+                # (B,) index to the best teacher
+                teacher_inds = torch.topk(scores, 1, dim=1).indices.squeeze().tolist()
+                # (K, B, seq_len, vocab_size) gather logits that come from the best teacher
+                logits_t_best = torch.stack([logits_t_list[i][j] for j, i in enumerate(teacher_inds)])
 
-                # (B, num_teachers)
-                teacher_pick = torch.topk(scores, 1, dim=1).indices
-                # (B,)
-                losses = torch.gather(losses, 1, teacher_pick)
+                # (num_students,) kd loss corresponding to teach student
+                losses = []
+                for tokscale_s in tokscales_s:
+                    tokscale_s_id = tokscales.index(tokscale_s)
+                    logits_s = logits_list[tokscale_s_id]
+                    losses_per_student = tokenwise_kd_loss(logits_t_best.cpu(), logits_s.cpu(), labels.cpu(), temperature, detach_teacher_grad, reduction='seqlevel_mean')
+                    if not distil_from_same_tokscale:
+                        mask_ts_different_tokscale = [ tokscales_t[idx] !=  tokscale_s for idx in teacher_inds ]
+                        mask_ts_different_tokscale = torch.tensor(mask_ts_different_tokscale, dtype=losses_per_student.dtype, device=losses_per_student.device)
+                        losses_per_student = losses_per_student * mask_ts_different_tokscale
+                    loss_per_student = losses_per_student.sum() # summing due to `tokenwise_kd_loss` implementation.
+                    losses.append(loss_per_student)
                 # (1,)
-                loss_distil = losses.sum() # summing due to `tokenwise_kd_loss` implementation.
+                loss_distil = alpha * losses.sum()
                 loss += loss_distil
 
 
