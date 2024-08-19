@@ -469,13 +469,12 @@ class LlavaMetaForCausalLM(ABC):
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] only support batch_size=1 for matryoshka_vis_token_scale={matryoshka_vis_token_scale} but got {image_features.shape[0]}. This is ok since only used during inference.')
                 numtoks_idx = torch.argmax(gating_prob.squeeze(0)).item()
                 numtoks = self.get_model().tokscale_list[numtoks_idx]
-
-                import json
-                with open('/fsx/wpq/.results/router_test/gating_prob.jsonl', 'a') as f:
-                    f.write(json.dumps({
-                        'gating_prob': gating_prob.detach().cpu().to(torch.float32).numpy().squeeze().tolist(),
-                        'numtoks_idx': numtoks_idx,
-                    }, indent=4) + '\n')
+                # import json
+                # with open('/fsx/wpq/.results/router_test/gating_prob.jsonl', 'a') as f:
+                #     f.write(json.dumps({
+                #         'gating_prob': gating_prob.detach().cpu().to(torch.float32).numpy().squeeze().tolist(),
+                #         'numtoks_idx': numtoks_idx,
+                #     }, indent=4) + '\n')
 
             else:
                 numtoks = int(kvs['numtoks'])

@@ -569,11 +569,9 @@ class LLaVATrainer(Trainer):
                 tokscales_t = eval(kvs['tst'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
 
-                labels = outputs.labels
-                logits = outputs.logits
                 sequence_lengths = outputs.sequence_lengths
-                labels_list = list(labels.split(sequence_lengths, 1))
-                logits_list = list(logits.split(sequence_lengths, 1))
+                labels_list = list(outputs.labels.split(sequence_lengths, 1))
+                logits_list = list(outputs.logits.split(sequence_lengths, 1))
                 # pad to same length as largest 
                 logits_list = pad_logits_to_longest(logits_list, max([x.shape[1] for x in logits_list]))
                 labels = labels_list[-1] # last tokcale is biggest token scale.
@@ -599,7 +597,8 @@ class LLaVATrainer(Trainer):
                 tokscales_t = eval(kvs['tst'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
                 pick_teacher_by = kvs['pickby']
-                distil_from_same_tokscale = bool(kvs.get('sametokscaledistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
+                distil_from_same_tokscale = int(kvs.get('sametsdistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
+                teacher_type = kvs['teachert'] # 'best', 'avg'
 
                 if pick_teacher_by == 'logprob': # higher the better
                     score_fn = compute_seq_logprob
@@ -609,85 +608,86 @@ class LLaVATrainer(Trainer):
                     score_fn = lambda *args, **kwargs: -compute_seq_brier(*args, **kwargs)
                 elif pick_teacher_by == 'entropy': # lower the better (more certain)
                     score_fn = lambda *args, **kwargs: -compute_seq_entropy(*args, **kwargs)
+                elif pick_teacher_by == 'uniform':
+                    score_fn = lambda logits, labels, level: torch.ones(logits.shape[0], device=logits.device, dtype=logits.dtype) / len(tokscales_t)
                 else:
                     raise ValueError(f'pick teacher by {pick_teacher_by} not implemented.')
 
-                labels = outputs.labels
-                logits = outputs.logits
                 sequence_lengths = outputs.sequence_lengths
-                labels_list = list(labels.split(sequence_lengths, 1))
-                logits_list = list(logits.split(sequence_lengths, 1))
+                labels_list = list(outputs.labels.split(sequence_lengths, 1))
+                logits_list = list(outputs.logits.split(sequence_lengths, 1))
                 # pad to same length as largest 
                 logits_list = pad_logits_to_longest(logits_list, max([x.shape[1] for x in logits_list]))
+                labels = labels_list[-1] # last tokcale is biggest token scale.
 
                 # logits corresponding to teachers [(B, longest seq_len, vocab_size), ...]
                 logits_t_list = [ logits_list[tokscales.index(tokscale_t)] for tokscale_t in tokscales_t ]
-                # compute score to select the teacher
-                scores = [ score_fn(logits_t, labels) for logits_t in logits_t_list ]
-
-                # (B, K)
-                scores = torch.stack(scores).T
-                # (B,) index to the best teacher
-                teacher_inds = torch.topk(scores, 1, dim=1).indices.squeeze().tolist()
-                # (K, B, seq_len, vocab_size) gather logits that come from the best teacher
-                logits_t_best = torch.stack([logits_t_list[i][j] for j, i in enumerate(teacher_inds)])
+                if teacher_type == 'best': # best sequence.
+                    # [(B,), ...]
+                    scores = [ score_fn(logits_t, labels, level='seq`') for logits_t in logits_t_list ]
+                    # (B, K)
+                    scores = torch.stack(scores).T
+                    # (B,) index to the best teacher
+                    teacher_inds = torch.topk(scores, 1, dim=1).indices.squeeze().tolist()
+                    # (B, seq_len, vocab_size) gather logits that come from the best teacher
+                    logits_t_best = torch.stack([logits_t_list[i][j] for j, i in enumerate(teacher_inds)])
+                elif teacher_type == 'besttoken':
+                    ## NOTE: besttoken does not work with `distil_from_same_tokscale` for now.
+                    # [(B, seq_len-1), ...] where B is micro-bsz
+                    scores = [ score_fn(logits_t, labels, level='token') for logits_t in logits_t_list ]
+                    # (num_teachers, B, seq_len-1)
+                    scores = torch.stack(scores)
+                    # (num_teachers, B, seq_len) pad to `seq_len`. last sequence position will be disgarded when computing kd loss.
+                    scores = torch.cat((scores, torch.zeros((scores.shape[0], scores.shape[1], 1), dtype=scores.dtype, device=scores.device)), 2)
+                    # (num_teachers, B*seq_len)
+                    micro_bsz = scores.shape[1]
+                    seq_len = scores.shape[2]
+                    scores = scores.reshape(-1, micro_bsz*seq_len)
+                    # (B*seq_len,) containing {0, ..., num_teachers-1} indicating per-token best teacher
+                    teacher_inds = torch.topk(scores, 1, dim=0).indices.squeeze(0).tolist()
+                    # [(B*seq_len, vocab_size), ...] reshape for indexing next.
+                    logits_t_list_reshaped = [x.reshape(-1, x.shape[-1]) for x in logits_t_list]
+                    # (B*seq_len, vocab_size) gather logits that come from the best teacher
+                    logits_t_best = torch.stack([logits_t_list_reshaped[i][j] for j, i in enumerate(teacher_inds)])
+                    # (B, seq_len, vocab_size)
+                    logits_t_best = logits_t_best.reshape(micro_bsz, seq_len, -1)
+                elif teacher_type == 'avg':
+                    # (B, seq_len, vocab_size)
+                    logits_t_best = torch.stack(logits_t_list).mean(0)
+                else:
+                    raise ValueError(f'invalid teacher_type {teacher_type}')
 
                 # (num_students,) kd loss corresponding to teach student
                 losses = []
                 for tokscale_s in tokscales_s:
                     tokscale_s_id = tokscales.index(tokscale_s)
                     logits_s = logits_list[tokscale_s_id]
-                    losses_per_student = tokenwise_kd_loss(logits_t_best.cpu(), logits_s.cpu(), labels.cpu(), temperature, detach_teacher_grad, reduction='seqlevel_mean')
-                    if not distil_from_same_tokscale:
-                        mask_ts_different_tokscale = [ tokscales_t[idx] !=  tokscale_s for idx in teacher_inds ]
-                        mask_ts_different_tokscale = torch.tensor(mask_ts_different_tokscale, dtype=losses_per_student.dtype, device=losses_per_student.device)
-                        losses_per_student = losses_per_student * mask_ts_different_tokscale
+                    losses_per_student = tokenwise_kd_loss(logits_t_best, logits_s, labels, temperature, detach_teacher_grad, reduction='seqlevel_mean')
+                    if distil_from_same_tokscale > 0:
+                        if distil_from_same_tokscale == 1:
+                            mask_distil_seq = [ tokscales_t[idx] !=  tokscale_s for idx in teacher_inds ]
+                        elif distil_from_same_tokscale == 2:
+                            mask_distil_seq = [ tokscales_t[idx] >  tokscale_s for idx in teacher_inds ]
+                        else:
+                            raise ValueError(f'Invalid `distil_from_same_tokscale` {distil_from_same_tokscale}')
+                        mask_distil_seq = torch.tensor(mask_distil_seq, dtype=losses_per_student.dtype, device=losses_per_student.device)
+                        losses_per_student = losses_per_student * mask_distil_seq
                     loss_per_student = losses_per_student.sum() # summing due to `tokenwise_kd_loss` implementation.
                     losses.append(loss_per_student)
+
                 # (1,)
+                losses = torch.stack(losses)
                 loss_distil = alpha * losses.sum()
                 loss += loss_distil
-
-
-                # scores_ppl = torch.stack([compute_seq_ppl(logits_list[1], labels), compute_seq_ppl(logits_list[2], labels)]).T
-
-                # print(scores[:,1] > scores[:,0])
-
-                # scores_acc = torch.stack([compute_seq_accuracy(logits_list[1], labels), compute_seq_accuracy(logits_list[2], labels)]).T
-
-                # scores_brier = torch.stack([compute_seq_brier(logits_list[1].cpu(), labels.cpu()), compute_seq_accuracy(logits_list[2].cpu(), labels.cpu())]).T
-
-                # print(scores_brier[:,1] > scores_brier[:,0])
-
-                # scores_entropy = torch.stack([compute_seq_entropy(logits_list[1].cpu(), labels.cpu()), compute_seq_accuracy(logits_list[2].cpu(), labels.cpu())]).T
-
-
-                # shifted_logits = logits_list[-1].detach().clone()[..., :-1, :].contiguous()
-                # shifted_labels = labels.detach().clone()[..., 1:].contiguous()
-                # mask = shifted_labels != -100
-
-                
-                # # Gather the corresponding losses using the indices
-                # selected_losses = torch.gather(losses_tensor, 1, top_k_indices)
-                
-                # logprob_seq_s = compute_seq_logprob(logits_s, labels_t)
-                # logprob_seq_t1 = compute_seq_logprob(logits_list[1], labels_list[1])
-                # logprob_seq_t2 = compute_seq_logprob(logits_list[2], labels_list[2])
-
-                # ppl_seq_s = (-logprob_seq_s).exp()
-                # ppl_seq_t = (-logprob_seq_t).exp()
-
-                # t = torch.stack((ppl_seq_s, ppl_seq_t)).T
-                # teacher_better_inds = torch.where(ppl_seq_t < ppl_seq_s)[0].tolist()
 
                 # from transformers import AutoTokenizer
                 # tokenizer = AutoTokenizer.from_pretrained('/fsx/wpq/.results/baselines/lmsys/vicuna-7b-v1.5')
 
                 # input_ids = inputs['input_ids'].cpu().clone()
                 # input_ids[input_ids==-200] = 0
-
-                # for i in teacher_better_inds:
-                #     print(i, '\t', 'USER:'+ tokenizer.decode(input_ids[i]).split('USER:')[-1].replace('<unk>',''))
+                # for i in range(len(inputs['input_ids'])):
+                #     teacher_ind = teacher_inds[i]
+                #     print(teacher_ind, '\t', 'USER:'+ tokenizer.decode(input_ids[i]).split('USER:')[-1].replace('<unk>',''))
             
 
                 if self.is_world_process_zero() and 'wandb' in self.args.report_to:
@@ -779,8 +779,7 @@ class LLaVATrainer(Trainer):
         return loss.detach() / self.args.gradient_accumulation_steps
     
 
-
-def compute_seq_logprob(logits, labels):
+def compute_seq_logprob(logits, labels, level='seq'):
     """Compute sequence-level log-probability """
     logits = logits.detach()
     labels = labels.detach()
@@ -789,33 +788,18 @@ def compute_seq_logprob(logits, labels):
     logprob = torch.nn.functional.log_softmax( logits, dim=-1 )
     mask = labels != -100
     labels_masked = labels * mask
-    # (B, seq_len-1, 1)
+    # (B, seq_len-1)
     logprob_gathered = logprob.gather(-1, labels_masked.unsqueeze(-1)).squeeze(-1)
     logprob_masked = logprob_gathered * mask
-    # (B,)
-    # logprob_seq = logprob_masked.sum(1) / mask.sum(1)
-    logprob_seq = logprob_masked.sum(1)
-    return logprob_seq
+    if level == 'token': # (B, seq_len-1)
+        log_prob = logprob_masked
+    elif level == 'seq': # (B,)
+        log_prob = logprob_masked.sum(1)
+        # ppl_seq = torch.exp(-logprob_masked.sum(1) / mask.sum(1))
+    return log_prob
 
 
-def compute_seq_ppl(logits, labels):
-    """Compute sequence-level log-probability """
-    logits = logits.detach()
-    labels = labels.detach()
-    logits = logits[..., :-1, :].contiguous()
-    labels = labels[..., 1:].contiguous()
-    logprob = torch.nn.functional.log_softmax( logits, dim=-1 )
-    mask = labels != -100
-    labels_masked = labels * mask
-    # (B, seq_len-1, 1)
-    logprob_gathered = logprob.gather(-1, labels_masked.unsqueeze(-1)).squeeze(-1)
-    logprob_masked = logprob_gathered * mask
-    # (B,)
-    ppl_seq = torch.exp(-logprob_masked.sum(1) / mask.sum(1))
-    return ppl_seq
-
-
-def compute_seq_accuracy(logits, labels):
+def compute_seq_accuracy(logits, labels, level='seq'):
     logits = logits.detach()
     labels = labels.detach()
     logits = logits[..., :-1, :].contiguous()
@@ -825,12 +809,14 @@ def compute_seq_accuracy(logits, labels):
     predictions = torch.argmax(logits, dim=-1)
     correct = (predictions == labels).float()
     correct = correct * mask
-    # (B,)
-    accuracy_seq = correct.sum(1) / mask.sum(1)
-    return accuracy_seq
+    if level == 'token': # (B, seq_len-1)
+        accuracy = correct
+    elif level == 'seq': # (B,)
+        accuracy = correct.sum(1) / mask.sum(1)
+    return accuracy
 
 
-def compute_seq_brier(logits, labels):
+def compute_seq_brier(logits, labels, level='seq'):
     logits = logits.detach()
     labels = labels.detach()
     logits = logits[..., :-1, :].contiguous()
@@ -843,12 +829,14 @@ def compute_seq_brier(logits, labels):
     # (B, seq_len-1)
     brier_loss = sq_diff.sum(-1)
     brier_loss = brier_loss * mask
-    # (B,)
-    brier_loss = brier_loss.sum(1) / mask.sum(1)
+    if level == 'token': # (B, seq_len-1)
+        brier_loss = brier_loss
+    elif level == 'seq': # (B,)
+        brier_loss = brier_loss.sum(1) / mask.sum(1)
     return brier_loss
 
 
-def compute_seq_entropy(logits, labels):
+def compute_seq_entropy(logits, labels, level='seq'):
     logits = logits.detach()
     labels = labels.detach()
     logits = logits[..., :-1, :].contiguous()
@@ -860,9 +848,11 @@ def compute_seq_entropy(logits, labels):
     # (B, seq_len-1)
     entropy_token = -torch.sum(probs * logprobs, dim=-1)
     entropy_token = entropy_token * mask
-    # (B,)
-    entropy_seq = entropy_token.sum(1) / mask.sum(1)
-    return entropy_seq
+    if level == 'token': # (B, seq_len-1)
+        entropy = entropy_token
+    elif level == 'seq': # (B,)
+        entropy = entropy_token.sum(1) / mask.sum(1)
+    return entropy
 
 
 def pad_logits_to_longest(logits_list, max_seq_len):
