@@ -597,7 +597,7 @@ class LLaVATrainer(Trainer):
                 tokscales_t = eval(kvs['tst'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
                 pick_teacher_by = kvs['pickby']
-                distil_from_same_tokscale = int(kvs.get('sametsdistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
+                distil_ignore_mode = int(kvs.get('sametsdistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
                 teacher_type = kvs['teachert'] # 'best', 'avg'
 
                 if pick_teacher_by == 'logprob': # higher the better
@@ -620,11 +620,14 @@ class LLaVATrainer(Trainer):
                 logits_list = pad_logits_to_longest(logits_list, max([x.shape[1] for x in logits_list]))
                 labels = labels_list[-1] # last tokcale is biggest token scale.
 
+                micro_bsz = labels.shape[0]
+                seq_len = labels.shape[1]
+
                 # logits corresponding to teachers [(B, longest seq_len, vocab_size), ...]
                 logits_t_list = [ logits_list[tokscales.index(tokscale_t)] for tokscale_t in tokscales_t ]
                 if teacher_type == 'best': # best sequence.
                     # [(B,), ...]
-                    scores = [ score_fn(logits_t, labels, level='seq`') for logits_t in logits_t_list ]
+                    scores = [ score_fn(logits_t, labels, level='seq') for logits_t in logits_t_list ]
                     # (B, K)
                     scores = torch.stack(scores).T
                     # (B,) index to the best teacher
@@ -632,7 +635,6 @@ class LLaVATrainer(Trainer):
                     # (B, seq_len, vocab_size) gather logits that come from the best teacher
                     logits_t_best = torch.stack([logits_t_list[i][j] for j, i in enumerate(teacher_inds)])
                 elif teacher_type == 'besttoken':
-                    ## NOTE: besttoken does not work with `distil_from_same_tokscale` for now.
                     # [(B, seq_len-1), ...] where B is micro-bsz
                     scores = [ score_fn(logits_t, labels, level='token') for logits_t in logits_t_list ]
                     # (num_teachers, B, seq_len-1)
@@ -640,8 +642,6 @@ class LLaVATrainer(Trainer):
                     # (num_teachers, B, seq_len) pad to `seq_len`. last sequence position will be disgarded when computing kd loss.
                     scores = torch.cat((scores, torch.zeros((scores.shape[0], scores.shape[1], 1), dtype=scores.dtype, device=scores.device)), 2)
                     # (num_teachers, B*seq_len)
-                    micro_bsz = scores.shape[1]
-                    seq_len = scores.shape[2]
                     scores = scores.reshape(-1, micro_bsz*seq_len)
                     # (B*seq_len,) containing {0, ..., num_teachers-1} indicating per-token best teacher
                     teacher_inds = torch.topk(scores, 1, dim=0).indices.squeeze(0).tolist()
@@ -662,16 +662,23 @@ class LLaVATrainer(Trainer):
                 for tokscale_s in tokscales_s:
                     tokscale_s_id = tokscales.index(tokscale_s)
                     logits_s = logits_list[tokscale_s_id]
-                    losses_per_student = tokenwise_kd_loss(logits_t_best, logits_s, labels, temperature, detach_teacher_grad, reduction='seqlevel_mean')
-                    if distil_from_same_tokscale > 0:
-                        if distil_from_same_tokscale == 1:
-                            mask_distil_seq = [ tokscales_t[idx] !=  tokscale_s for idx in teacher_inds ]
-                        elif distil_from_same_tokscale == 2:
-                            mask_distil_seq = [ tokscales_t[idx] >  tokscale_s for idx in teacher_inds ]
+                    if distil_ignore_mode > 0:
+                        if distil_ignore_mode == 1:
+                            mask_distil_ignore = [ tokscales_t[idx] ==  tokscale_s for idx in teacher_inds ]
+                        elif distil_ignore_mode == 2:
+                            mask_distil_ignore = [ tokscales_t[idx] <=  tokscale_s for idx in teacher_inds ]
                         else:
-                            raise ValueError(f'Invalid `distil_from_same_tokscale` {distil_from_same_tokscale}')
-                        mask_distil_seq = torch.tensor(mask_distil_seq, dtype=losses_per_student.dtype, device=losses_per_student.device)
-                        losses_per_student = losses_per_student * mask_distil_seq
+                            raise ValueError(f'Invalid `distil_ignore_mode` {distil_ignore_mode}')
+                        mask_distil_ignore = torch.tensor(mask_distil_ignore, dtype=bool, device=logits_s.device)
+                        if teacher_type == 'best': # (B,) -> (B, seq_len)
+                            mask_distil_ignore = mask_distil_ignore.reshape(micro_bsz, 1).repeat(1, seq_len)
+                        elif teacher_type == 'besttoken': # (B*seq_len,) -> (B, seq_len)
+                            mask_distil_ignore = mask_distil_ignore.reshape(micro_bsz, seq_len)
+                        else:
+                            raise ValueError(f'Cannote compute `mask_distil_ignore` for distil_ignore_mode {distil_ignore_mode}')
+                        labels_t = labels.clone()
+                        labels_t[mask_distil_ignore] = -100
+                    losses_per_student = tokenwise_kd_loss(logits_t_best, logits_s, labels_t, temperature, detach_teacher_grad, reduction='seqlevel_mean')
                     loss_per_student = losses_per_student.sum() # summing due to `tokenwise_kd_loss` implementation.
                     losses.append(loss_per_student)
 
