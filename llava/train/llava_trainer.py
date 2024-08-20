@@ -596,9 +596,11 @@ class LLaVATrainer(Trainer):
                 tokscales_s = eval(kvs['tss'])
                 tokscales_t = eval(kvs['tst'])
                 tokscales = eval(parse_kv_from_string(self.model.config.config.get('matryoshka_vis_token_scale', None)).get('numtoks', None))
-                pick_teacher_by = kvs['pickby']
+                pick_teacher_by = kvs.get('pickby', None)
                 distil_ignore_mode = int(kvs.get('sametsdistil', 0)) # only makes a difference if `tokscales_s` and `tokscales_t` overlaps
                 teacher_type = kvs['teachert'] # 'best', 'avg'
+                if len(set(tokscales_s) - set(tokscales)) != 0 or len(set(tokscales_t) - set(tokscales)) != 0:
+                    raise ValueError(f'tokscales_s={tokscales_s} tokscales_t={tokscales_t} has some token scale not in tokenscales={tokscales}')
 
                 if pick_teacher_by == 'logprob': # higher the better
                     score_fn = compute_seq_logprob
@@ -611,7 +613,8 @@ class LLaVATrainer(Trainer):
                 elif pick_teacher_by == 'uniform':
                     score_fn = lambda logits, labels, level: torch.ones(logits.shape[0], device=logits.device, dtype=logits.dtype) / len(tokscales_t)
                 else:
-                    raise ValueError(f'pick teacher by {pick_teacher_by} not implemented.')
+                    pass
+                    # raise ValueError(f'pick teacher by {pick_teacher_by} not implemented.')
 
                 sequence_lengths = outputs.sequence_lengths
                 labels_list = list(outputs.labels.split(sequence_lengths, 1))
@@ -651,6 +654,25 @@ class LLaVATrainer(Trainer):
                     logits_t_best = torch.stack([logits_t_list_reshaped[i][j] for j, i in enumerate(teacher_inds)])
                     # (B, seq_len, vocab_size)
                     logits_t_best = logits_t_best.reshape(micro_bsz, seq_len, -1)
+                elif teacher_type == 'cd':
+                    beta = float(kvs['beta'])
+                    gamma = float(kvs['gamma'])
+                    if len(logits_t_list) != 2:
+                        raise ValueError('Only support contrasting two teachers for now.')
+                    # (B, seq_len, vocab_size)
+                    logits_exp = logits_t_list[1]
+                    logits_ama = logits_t_list[0]
+                    logits_t_best = (1 + beta) * logits_exp - beta * logits_ama
+                    # plausibility constraint: $p(y|x_{576}) >= \gamma \max_c p(c|x_{576})$
+                    # set above contrasted logits to -Inf on constraint violation, i.e., $p(y|x_{576}) < \gamma \max_c p(c|x_{576})$
+                    if gamma > 0:
+                        # (B, seq_len, vocab_size)
+                        probs_exp = torch.nn.functional.softmax(logits_exp, dim=-1)
+                        # (B, seq_len, 1)
+                        probs_exp_max = torch.max(probs_exp, dim=2, keepdim=True).values
+                        # (B, seq_len, vocab_size)
+                        mask_constraint_violation = probs_exp < gamma * probs_exp_max
+                        logits_t_best[mask_constraint_violation] = float('-inf')
                 elif teacher_type == 'avg':
                     # (B, seq_len, vocab_size)
                     logits_t_best = torch.stack(logits_t_list).mean(0)
@@ -678,6 +700,8 @@ class LLaVATrainer(Trainer):
                             raise ValueError(f'Cannote compute `mask_distil_ignore` for distil_ignore_mode {distil_ignore_mode}')
                         labels_t = labels.clone()
                         labels_t[mask_distil_ignore] = -100
+                    else:
+                        labels_t = labels
                     losses_per_student = tokenwise_kd_loss(logits_t_best, logits_s, labels_t, temperature, detach_teacher_grad, reduction='seqlevel_mean')
                     loss_per_student = losses_per_student.sum() # summing due to `tokenwise_kd_loss` implementation.
                     losses.append(loss_per_student)
