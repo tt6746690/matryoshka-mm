@@ -38,6 +38,17 @@ def eval_model(args):
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
+
+
+    from rosemary import parse_kv_from_string
+    combine_logits = False
+    matryoshka_vis_token_scale = getattr(args, "matryoshka_vis_token_scale", None)
+    if matryoshka_vis_token_scale is not None:
+        kvs = parse_kv_from_string(matryoshka_vis_token_scale)
+        if kvs['ver'] == 'v2':
+            combine_logits = True
+
+
     for line in tqdm(questions):
         idx = line["question_id"]
         image_file = line["image"]
@@ -72,7 +83,16 @@ def eval_model(args):
                 use_cache=True,
                 matryoshka_vis_token_scale = getattr(args, "matryoshka_vis_token_scale", None))
 
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        if combine_logits:
+            input_token_len = input_ids.shape[1]
+            n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+            if n_diff_input_output > 0:
+                print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
+            outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
+            outputs = outputs.strip()
+        else:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
 
         ans_id = shortuuid.uuid()
         ans_file.write(json.dumps({"question_id": idx,

@@ -25,6 +25,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from .generationmixin_patch import update_generation_mixin_greedy_search; update_generation_mixin_greedy_search()
+
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
@@ -282,7 +284,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        matryoshka_vis_token_scale: Optional[str] = None,
     ) -> Union[Tuple, CausalLMOutputWithPastWithGatingProb]:
+
 
         if self.training and self.get_model().is_m3:
             # "The model is in training mode."
@@ -375,6 +379,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
             
         else:
+
+            # print(f'before prepareinputs: ', {
+            #     'inputs_embeds': inputs_embeds.shape if inputs_embeds is not None else None,
+            #     'input_ids': input_ids.shape if input_ids is not None else None,
+            # })
+
             # "The model is in evaluation mode or trained without matryoshka_vis_token_scale."
             if inputs_embeds is None:
                 (
@@ -392,10 +402,82 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     past_key_values,
                     labels,
                     images,
-                    image_sizes
+                    image_sizes,
+                    matryoshka_vis_token_scale=matryoshka_vis_token_scale,
                 )
             else:
                 gating_prob = None
+
+
+            # print(f'after prepareinputs: ', {
+            #     'inputs_embeds': inputs_embeds.shape if inputs_embeds is not None else None,
+            #     'input_ids': input_ids.shape if input_ids is not None else None,
+            # })
+
+            # t=0
+            # before prepareinputs:  {'inputs_embeds': None, 'input_ids': torch.Size([1, 68])}
+            # after prepareinputs:  {'inputs_embeds': torch.Size([1, 68, 4096]), 'input_ids': None}
+            # before prepareinputs:  {'inputs_embeds': None, 'input_ids': torch.Size([1, 68])}
+            # after prepareinputs:  {'inputs_embeds': torch.Size([1, 643, 4096]), 'input_ids': None}
+            # t=1
+            # before prepareinputs:  {'inputs_embeds': None, 'input_ids': torch.Size([1, 1])}
+            # after prepareinputs:  {'inputs_embeds': None, 'input_ids': torch.Size([1, 1])}
+            # before prepareinputs:  {'inputs_embeds': None, 'input_ids': torch.Size([1, 69])} issue with input_ids not [1,1]
+            # after prepareinputs:  {'inputs_embeds': torch.Size([1, 644, 4096]), 'input_ids': None}
+
+            # import pdb; pdb.set_trace()
+
+            # print(attention_mask.shape, position_ids.shape, inputs_embeds.shape)
+            # t=0
+            # torch.Size([1, 68]) torch.Size([1, 68]) torch.Size([1, 68, 4096])
+            # torch.Size([1, 643]) torch.Size([1, 643]) torch.Size([1, 643, 4096])
+            # t=1
+            # print(attention_mask.shape, position_ids.shape, inputs_embeds.shape, past_key_values[0][0].shape)
+            # torch.Size([1, 69]) torch.Size([1, 1]) 
+            # torch.Size([1, 644]) torch.Size([1, 644]) torch.Size([1, 644, 4096]) torch.Size([1, 32, 643, 128])
+            # 
+            # fails here.
+            #     expanded_attn_mask = causal_4d_mask.masked_fill(expanded_attn_mask.bool(), torch.finfo(dtype).min)
+            # RuntimeError: The size of tensor a (644) must match the size of tensor b (1287) at non-singleton dimension 3
+            # 
+            # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py#L1035
+            # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/modeling_attn_mask_utils.py#L398C1-L403C10
+            # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/modeling_attn_mask_utils.py#L137
+
+            # # # (1, 644)
+            # if input_ids is not None:
+            #     batch_size, seq_length = input_ids.shape[:2]
+            # elif inputs_embeds is not None:
+            #     batch_size, seq_length = inputs_embeds.shape[:2]
+            # from transformers.cache_utils import DynamicCache
+            # from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
+
+            # if past_key_values is not None:
+            #     past_key_values_ = DynamicCache.from_legacy_cache(past_key_values)
+            #     past_key_values_length = past_key_values_.get_usable_length(seq_length) # 643
+            # else:
+            #     past_key_values_length = None
+            # print(attention_mask.shape if attention_mask is not None else None,
+            #         inputs_embeds.shape if inputs_embeds is not None else None,
+            #         past_key_values_length if past_key_values_length is not None else None,)
+
+            # generate:
+            # t=0 
+            # torch.Size([1, 68]) torch.Size([1, 68, 4096]) None
+            # torch.Size([1, 643]) torch.Size([1, 643, 4096]) None
+            # t=1
+            # torch.Size([1, 69]) None 68
+            # torch.Size([1, 644]) torch.Size([1, 644, 4096]) 643
+            # 
+
+            # attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+            #     attention_mask, # (1, 644)
+            #     (batch_size, seq_length), # (1, 644)
+            #     inputs_embeds, # (1, 644, 4096)
+            #     past_key_values_length,  # 643
+            # )
+            # 
+            
 
             # outputs: (loss, logits, past_key_values, hidden_states, attentions)
             outputs = super().forward(
@@ -411,10 +493,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict
             )
 
+
             if not return_dict:
                 if not isinstance(outputs, tuple):
                     outputs = outputs.to_tuple()
-                return outputs + (None, None, gating_prob,)
+                return outputs + (None, None, gating_prob, None, None)
 
             return CausalLMOutputWithPastWithGatingProb(
                 loss=outputs.loss,
@@ -430,7 +513,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
 
-
     @torch.no_grad()
     def generate(
         self,
@@ -442,48 +524,106 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         matryoshka_vis_token_scale = kwargs.pop("matryoshka_vis_token_scale", None)
-        if "inputs_embeds" in kwargs:
-            raise NotImplementedError("`inputs_embeds` is not supported")
-        if images is not None:
-            (
-                inputs,
-                position_ids,
-                attention_mask,
-                _,
-                inputs_embeds,
-                _,
-                _,
-            ) = self.prepare_inputs_labels_for_multimodal(
-                inputs,
-                position_ids,
-                attention_mask,
-                None,
-                None,
-                images,
-                image_sizes=image_sizes,
-                matryoshka_vis_token_scale = matryoshka_vis_token_scale
+
+        combine_logits = False
+        if matryoshka_vis_token_scale is not None:
+            kvs = parse_kv_from_string(matryoshka_vis_token_scale)
+            if kvs['ver'] == 'v2':
+                combine_logits = True
+
+        if not combine_logits:
+            if "inputs_embeds" in kwargs:
+                raise NotImplementedError("`inputs_embeds` is not supported")
+            if images is not None:
+                (
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    _,
+                    inputs_embeds,
+                    _,
+                    _,
+                ) = self.prepare_inputs_labels_for_multimodal(
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    None,
+                    None,
+                    images,
+                    image_sizes=image_sizes,
+                    matryoshka_vis_token_scale = matryoshka_vis_token_scale
+                )
+            else: # text only
+                inputs_embeds = self.get_model().embed_tokens(inputs)
+
+            return super().generate(
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                **kwargs
             )
-        else: # text only
-            inputs_embeds = self.get_model().embed_tokens(inputs)
+        else:
+            # inputs: (B, seq_len) is input_ids
+            if "inputs_embeds" in kwargs:
+                raise NotImplementedError("`inputs_embeds` is not supported")
+            kwargs['matryoshka_vis_token_scale'] = matryoshka_vis_token_scale
+            kwargs['images'] = images
+            kwargs['image_sizes'] = image_sizes
+            return super().generate(
+                inputs=inputs,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **kwargs
+            )
+    
 
-        return super().generate(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            **kwargs
-        )
-
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None,
                                       inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
-        inputs = super().prepare_inputs_for_generation(
-            input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
-        )
+        matryoshka_vis_token_scale = kwargs.pop('matryoshka_vis_token_scale', None)
+
+        combine_logits = False
+        if matryoshka_vis_token_scale is not None:
+            kvs = parse_kv_from_string(matryoshka_vis_token_scale)
+            if kvs['ver'] == 'v2':
+                combine_logits = True
+
+        if not combine_logits:
+            inputs = super().prepare_inputs_for_generation(
+                input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
+            )
+        else:
+            # https://github.com/DAMO-NLP-SG/VCD/blob/c637c85a792262e9965185a2961ca40d30d6de79/experiments/llava/model/language_model/llava_llama.py#L121
+            # This is necessary, since if without this, t=1 input_ids has shape (1, 68) instead of (1, 1)
+            # 
+            # print(input_ids.shape, model_inputs['input_ids'].shape)
+            # t=0
+            # torch.Size([1, 68]) torch.Size([1, 68])
+            # torch.Size([1, 68]) torch.Size([1, 68])
+            # t=1
+            # torch.Size([1, 69]) torch.Size([1, 1])
+            # torch.Size([1, 69]) torch.Size([1, 1]) correct after fix `prepare_inputs_for_generation`
+            if past_key_values:
+                input_ids = input_ids[:, -1:]
+            # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+            if inputs_embeds is not None and past_key_values is None:
+                inputs = {"inputs_embeds": inputs_embeds}
+            else:
+                inputs = {"input_ids": input_ids}
+            inputs.update(
+                {
+                    "past_key_values": past_key_values,
+                    "use_cache": kwargs.get("use_cache"),
+                    "attention_mask": attention_mask,
+                }
+            )
         if images is not None:
             inputs['images'] = images
         if image_sizes is not None:
             inputs['image_sizes'] = image_sizes
+        if matryoshka_vis_token_scale is not None:
+            inputs['matryoshka_vis_token_scale'] = matryoshka_vis_token_scale
         return inputs
 
 AutoConfig.register("llava_llama", LlavaConfig)

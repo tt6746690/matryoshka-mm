@@ -461,7 +461,7 @@ class LlavaMetaForCausalLM(ABC):
         H = W = int(self.get_model().get_vision_tower().config.image_size / self.get_model().get_vision_tower().config.patch_size)
         kvs = parse_kv_from_string(matryoshka_vis_token_scale)
 
-        if kvs['ver'] == 'v0': 
+        if kvs['ver'] in ['v0', 'v2']: 
             if kvs['numtoks'] == 'gateprobargmax':
                 if gating_prob is None:
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] requires `gating_prob` to select the right token scale for matryoshka_vis_token_scale={matryoshka_vis_token_scale}')
