@@ -747,10 +747,25 @@ class LazySupervisedDataset(Dataset):
                         result = Image.new(pil_img.mode, (height, height), background_color)
                         result.paste(pil_img, ((height - width) // 2, 0))
                         return result
-                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                # multiple processor
+                if isinstance(processor, list):
+                    image_list = []
+                    for proc in processor:
+                        image_expanded = expand2square(image, tuple(int(x*255) for x in proc.image_mean))
+                        image_processed = proc.preprocess(image_expanded, return_tensors='pt')['pixel_values'][0]
+                        image_list.append(image_processed)
+                    image = tuple(image_list)
+                else:
+                    image = expand2square(image, tuple(int(x*255) for x in proc.image_mean))
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                if isinstance(processor, list):
+                    image = tuple([
+                        proc.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                        for proc in processor
+                    ])
+                else:
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -768,9 +783,17 @@ class LazySupervisedDataset(Dataset):
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            if isinstance(processor, list):
+                image_list = []
+                for proc in self.data_args.image_processor:
+                    crop_size = proc.crop_size
+                    image_list.append(torch.zeros(3, crop_size['height'], crop_size['width']))
+                image = tuple(image_list)
+            else:
+                # image does not exist in the data, but the model is multimodal
+                crop_size = self.data_args.image_processor.crop_size
+                image= torch.zeros(3, crop_size['height'], crop_size['width'])
+            data_dict['image'] = image
         return data_dict
 
 
@@ -799,11 +822,16 @@ class DataCollatorForSupervisedDataset(object):
         )
 
         if 'image' in instances[0]:
+            # multiple vision encoder
             images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
+            if isinstance(images[0], tuple):
+                # Tuple[(B, 3, H1, W1), ..., (B, 3, Hk, Wk)]
+                batch['images'] = tuple([x for x in torch.utils.data.default_collate(images)])
             else:
-                batch['images'] = images
+                if all(x is not None and x.shape == images[0].shape for x in images):
+                    batch['images'] = torch.stack(images)
+                else:
+                    batch['images'] = images
 
         return batch
 

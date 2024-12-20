@@ -254,6 +254,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     k = tokscale_list.index(kvs['numtoks'])
                     # (B, K) -> (B,)
                     gating_prob_k = gating_prob[:, k]
+            elif kvs['ver'] == 'v3':
+                if kvs['vt'] == 'gateprobargmax':
+                    gating_prob_k = None
+                else:
+                    # reached only during training
+                    vision_tower_list = self.get_model().vision_tower_list
+                    k = vision_tower_list.index(kvs['vt'])
+                    # (B, K) -> (B,)
+                    gating_prob_k = gating_prob[:, k]
         else:
             gating_prob_k = None
         ####
@@ -300,9 +309,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 matryoshka_vis_token_scale = []
                 for num_tok in num_toks:
                     kvs['numtoks'] = str(num_tok)
-                    matryoshka_vis_token_scale.append( create_string_from_kv(kvs) )
+                    matryoshka_vis_token_scale.append(create_string_from_kv(kvs))
+            elif kvs['ver'] == 'v3':
+                vision_tower_names = kvs['vt'].strip('[]').split(',') # str -> List
+                num_toks = eval(kvs['numtoks']) # str -> List
+                assert(len(num_toks)==1)
+                matryoshka_vis_token_scale = []
+                for vision_tower_name in vision_tower_names:
+                    kvs['numtoks'] = str(num_toks[0])
+                    kvs['vt'] = vision_tower_name
+                    matryoshka_vis_token_scale.append(create_string_from_kv(kvs))
             else:
                 raise ValueError(f"[llava.model.language_model.llava_llama.py] {kvs['ver']} not implemented.")
+
+            import pdb; pdb.set_trace()
 
             losses_accumulate = [] # can be weighted or not.
             losses_lm_accumulate = [] # unweighted lm loss

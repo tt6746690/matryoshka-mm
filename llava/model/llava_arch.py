@@ -18,7 +18,7 @@ import math, re
 import torch
 import torch.nn as nn
 
-from .multimodal_encoder.builder import build_vision_tower
+from .multimodal_encoder.builder import build_vision_tower, MultipleVisionTower
 from .multimodal_projector.builder import build_vision_projector
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -258,7 +258,10 @@ class LlavaMetaModel:
                     self.prompt_embed_model.load_model()
                     embed_dim += self.prompt_embed_model.hidden_size
                 if any(x in feature_types for x in ('cls', 'clslast', 'patchavgpool', 'poolout')):
-                    embed_dim += self.config.mm_hidden_size
+                    if isinstance(self.config.mm_hidden_size, (tuple, list)):
+                        embed_dim += self.config.mm_hidden_size[0]
+                    else:
+                        embed_dim += self.config.mm_hidden_size
                 elif any(x in feature_types for x in ('attnqk', 'attnkk')):
                     embed_dim += 576 # hard code for now.
                 else:
@@ -285,6 +288,16 @@ class LlavaMetaModel:
         return eval(parse_kv_from_string(self.config.config['matryoshka_vis_token_scale'])['numtoks']) \
             if self.is_m3_moe else []
 
+    @property
+    def vision_tower_list(self):
+        if self.is_m3_moe:
+            # vt=[clip336L,dinov2L] -> ['clip336L', 'dinov2L']
+            kvs = parse_kv_from_string(self.config.config['matryoshka_vis_token_scale'])
+            vision_towers = kvs['vt'].strip('[]').split(',')
+            return vision_towers
+        else:
+            return []
+    
     @property
     def is_m3(self):
         return self.use_alternative and \
@@ -348,9 +361,9 @@ class LlavaMetaForCausalLM(ABC):
     def get_router(self):
         return self.get_model().get_router()
 
-    def encode_images_with_attn(self, images):
+    def encode_images_with_attn(self, vision_tower, images):
         # images: (B, 3, H, W)
-        vision_tower = self.get_model().get_vision_tower().vision_tower
+        vision_tower = vision_tower.vision_tower
 
         outputs = {}
         def hook_k(module, input, output):
@@ -359,9 +372,14 @@ class LlavaMetaForCausalLM(ABC):
         def hook_q(module, input, output):
             outputs['q'] = output
 
-        #set hooks for extracting desired layer's k and q. 23 corresponds to the last layer
-        hook_handle_k = vision_tower.vision_model.encoder.layers[23].self_attn.k_proj.register_forward_hook(hook_k)
-        hook_handle_q = vision_tower.vision_model.encoder.layers[23].self_attn.q_proj.register_forward_hook(hook_q)
+        try:
+            #set hooks for extracting desired layer's k and q. 23 corresponds to the last layer
+            hook_handle_k = vision_tower.vision_model.encoder.layers[23].self_attn.k_proj.register_forward_hook(hook_k)
+            hook_handle_q = vision_tower.vision_model.encoder.layers[23].self_attn.q_proj.register_forward_hook(hook_q)
+            register_hook = True
+        except: 
+            register_hook = False
+            pass
 
         # forward
         image_forward_outs = vision_tower(
@@ -380,19 +398,23 @@ class LlavaMetaForCausalLM(ABC):
         # (B, D)
         pooled_output = image_forward_outs.pooler_output
 
-        #extract desired layer's k and q and remove hooks; calculate attention
-        k = outputs["k"]
-        q = outputs["q"]
+        if register_hook:
+            #extract desired layer's k and q and remove hooks; calculate attention
+            k = outputs["k"]
+            q = outputs["q"]
 
-        hook_handle_k.remove()
-        hook_handle_q.remove()
+            hook_handle_k.remove()
+            hook_handle_q.remove()
 
-        # (B, N) where N=576
-        D = cls_patch.shape[-1]
-        attn_qk = (q[:, :1, :] @ k[:, 1:, :].transpose(-2, -1)).squeeze(1) * D ** -0.5
-        attn_qk = torch.nn.functional.softmax(attn_qk, dim=-1)
-        attn_kk = (k[:, :1, :] @ k[:, 1:, :].transpose(-2, -1)).squeeze(1) * D ** -0.5
-        attn_kk = torch.nn.functional.softmax(attn_kk, dim=-1)
+            # (B, N) where N=576
+            D = cls_patch.shape[-1]
+            attn_qk = (q[:, :1, :] @ k[:, 1:, :].transpose(-2, -1)).squeeze(1) * D ** -0.5
+            attn_qk = torch.nn.functional.softmax(attn_qk, dim=-1)
+            attn_kk = (k[:, :1, :] @ k[:, 1:, :].transpose(-2, -1)).squeeze(1) * D ** -0.5
+            attn_kk = torch.nn.functional.softmax(attn_kk, dim=-1)
+        else:
+            attn_kk = None
+            attn_qk = None
 
         return {
             "patch": patch,
@@ -404,25 +426,41 @@ class LlavaMetaForCausalLM(ABC):
             'attnkk': attn_kk,
         }
 
-    def encode_images_original(self, images):
-        patch = self.get_model().get_vision_tower()(images)
+    def encode_images_original(self, vision_tower, images):
+        patch = vision_tower(images)
         return {
             'patch': patch,
         }
 
-    def encode_images(self, images):
+    def encode_images(self, images, matryoshka_vis_token_scale=None):
+
+        import pdb; pdb.set_trace()
+
+        vision_tower = self.get_model().get_vision_tower() #.vision_tower
         if self.get_model().is_m3:
-            return self.encode_images_with_attn(images)
+            if isinstance(vision_tower, MultipleVisionTower):
+                if not isinstance(images, tuple) or len(images) != len(vision_tower.vision_towers):
+                    raise ValueError(f'Got a tuple of len={len(images)} but there is {len(vision_tower.vision_towers)} vision towers.')
+                kvs = parse_kv_from_string(matryoshka_vis_token_scale)
+                if 'vt' not in kvs:
+                    raise ValueError(f'matryoshka_vis_token_scale {matryoshka_vis_token_scale} should contain vision_tower when using `MultipleVisionTower`')
+                vision_encoder_name = kvs['vt']
+                idx = vision_tower.vision_tower_names.index(vision_encoder_name)
+                vision_tower = vision_tower.vision_towers[idx]
+                images = images[idx]
+                return self.encode_images_with_attn(vision_tower, images)
+            else:
+                return self.encode_images_with_attn(vision_tower, images)
         else:
-            return self.encode_images_original(images)
+            return self.encode_images_original(vision_tower, images)
 
     def project(self, images, matryoshka_vis_token_scale=None, input_ids=None):
         """
             call the corresponding `project` function, 
                 e.g., if `self.get_model().projection_type` is "v1", then calls 
                     `self.project_v1()`
-        """        
-        encode_images_output = self.encode_images(images)
+        """
+        encode_images_output = self.encode_images(images, matryoshka_vis_token_scale=matryoshka_vis_token_scale)
         image_features = encode_images_output['patch'] # (B, L, D)
 
         projector_loc = self.get_model().config.config.get('projector_loc', 'after_vision_tower') \
@@ -461,7 +499,7 @@ class LlavaMetaForCausalLM(ABC):
         H = W = int(self.get_model().get_vision_tower().config.image_size / self.get_model().get_vision_tower().config.patch_size)
         kvs = parse_kv_from_string(matryoshka_vis_token_scale)
 
-        if kvs['ver'] in ['v0', 'v2']: 
+        if kvs['ver'] in ['v0', 'v2', 'v3']: 
             if kvs['numtoks'] == 'gateprobargmax':
                 if gating_prob is None:
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] requires `gating_prob` to select the right token scale for matryoshka_vis_token_scale={matryoshka_vis_token_scale}')
@@ -469,13 +507,6 @@ class LlavaMetaForCausalLM(ABC):
                     raise ValueError(f'[LlavaMetaForCausalLM.project_v4] only support batch_size=1 for matryoshka_vis_token_scale={matryoshka_vis_token_scale} but got {image_features.shape[0]}. This is ok since only used during inference.')
                 numtoks_idx = torch.argmax(gating_prob.squeeze(0)).item()
                 numtoks = self.get_model().tokscale_list[numtoks_idx]
-                # import json
-                # with open('/fsx/wpq/.results/router_test/gating_prob.jsonl', 'a') as f:
-                #     f.write(json.dumps({
-                #         'gating_prob': gating_prob.detach().cpu().to(torch.float32).numpy().squeeze().tolist(),
-                #         'numtoks_idx': numtoks_idx,
-                #     }, indent=4) + '\n')
-
             else:
                 numtoks = int(kvs['numtoks'])
 
@@ -516,18 +547,6 @@ class LlavaMetaForCausalLM(ABC):
         else:
             gating_prob = None
         return gating_prob
-    
-    def matryoshka_vis_token_process(self, image_features, matryoshka_vis_token_scale):
-        N, H_W, C = image_features.shape
-        H = W = int(H_W ** 0.5)
-        reshaped_tensor = image_features.view(N, H, W, C)
-        reshaped_tensor = reshaped_tensor.permute(0, 3, 1, 2)
-        pool_size = stride = int( np.sqrt(H_W / matryoshka_vis_token_scale) )
-        pooled_tensor = F.avg_pool2d(reshaped_tensor, kernel_size=pool_size, stride=stride)
-        image_features = pooled_tensor.permute(0, 2, 3, 1)
-        image_features = image_features.reshape(N, -1, C)
-        # print('image_features.shape :', image_features.shape)
-        return image_features
         
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
